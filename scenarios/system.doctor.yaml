@@ -1,0 +1,17 @@
+scenario:
+  id: system.doctor
+  api_version: 1
+  cli:
+    module: doctor
+    usage: sindri doctor
+  title: Run emergency server diagnostics
+  risk:
+    default: read
+  steps:
+    - id: os
+      name: Check operating system
+    - id: host
+      name: Collect host summary
+    - id: resources
+      name: Collect constrained resource diagnostics
+

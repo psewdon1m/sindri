@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "product": "sindri",
+  "version": "1.0.0-dev",
+  "repository": {
+    "url": "https://github.com/psewdon1m/exocortex-sindri",
+    "ref": "main",
+    "path": "."
+  },
+  "installer": {
+    "url": "https://raw.githubusercontent.com/psewdon1m/exocortex-sindri/main/install.sh",
+    "sha256": "0292b09baf7b09ba6571681225f3985060f9af522ca8a57728ffa9dfd13efa6c"
+  }
+}

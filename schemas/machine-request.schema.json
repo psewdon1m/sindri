@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Sindri machine request",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["action"],
+  "properties": {
+    "protocol_version": {
+      "type": "string",
+      "const": "1"
+    },
+    "request_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "action": {
+      "type": "string",
+      "pattern": "^[a-z]+(\\.[a-z_]+)+$"
+    },
+    "test": {
+      "type": "boolean"
+    },
+    "inputs": {
+      "type": "object"
+    },
+    "approval": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "approval_id": { "type": "string" },
+        "plan_hash": { "type": "string" },
+        "confirmation_phrase": { "type": "string" },
+        "hostname_confirmation": { "type": "string" }
+      }
+    }
+  }
+}
+

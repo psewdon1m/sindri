@@ -1,0 +1,39 @@
+#!/usr/bin/env sh
+set -eu
+
+ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+cmd="${1:-help}"
+
+case "$cmd" in
+  init)
+    if [ ! -f "$ROOT_DIR/install.sh" ]; then
+      echo "install.sh was not found in repository root: $ROOT_DIR" >&2
+      exit 2
+    fi
+    if [ ! -f "$ROOT_DIR/go.mod" ]; then
+      echo "Invalid Sindri repository: go.mod is missing" >&2
+      exit 2
+    fi
+    exec "$ROOT_DIR/install.sh"
+    ;;
+  version)
+    echo "Sindri 1.0.0-dev"
+    echo "Protocol version: 1"
+    echo "Platform: bootstrap"
+    echo "Build: source"
+    ;;
+  help|"")
+    echo "Sindri repository bootstrap"
+    echo
+    echo "Usage:"
+    echo "  ./sindri init"
+    echo "  ./sindri version"
+    echo "  ./sindri help"
+    ;;
+  *)
+    echo "Bootstrap supports only: init, version, help" >&2
+    exit 2
+    ;;
+esac
+

@@ -1,0 +1,38 @@
+scenario:
+  id: firewall.open
+  api_version: 1
+  cli:
+    module: firewall
+    action: open
+    usage: sindri firewall open [port] [protocol]
+  title: Open firewall port
+  description: Add an allow rule to UFW.
+  supported_systems:
+    - ubuntu-22.04
+    - ubuntu-24.04
+    - ubuntu-26.04
+  inputs:
+    port:
+      position: 1
+      type: integer
+      minimum: 1
+      maximum: 65535
+      required: true
+      prompt: Which port should be opened?
+    protocol:
+      position: 2
+      type: choice
+      values:
+        - tcp
+        - udp
+      default: tcp
+  risk:
+    default: change
+  steps:
+    - id: inspect_rule
+      name: Check existing rule
+    - id: add_rule
+      name: Add firewall rule
+    - id: verify_rule
+      name: Verify firewall rule
+

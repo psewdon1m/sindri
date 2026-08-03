@@ -1,0 +1,10 @@
+Package: sindri
+Version: 1.0.0
+Section: admin
+Priority: optional
+Architecture: amd64
+Maintainer: Perimetr <admin@example.invalid>
+Description: System CLI assistant for Ubuntu Server
+ Sindri automates common Ubuntu Server administration workflows through
+ one scenario registry shared by CLI and machine JSON interfaces.
+
