@@ -4,7 +4,7 @@ set -eu
 ACTION="${1:-install}"
 ROOT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" 2>/dev/null && pwd)
 VERSION="${VERSION:-1.0.0-dev}"
-DEFAULT_MANIFEST_URL="https://github.com/psewdon1m/exocortex-sindri/releases/download/sindri-current/sindri-release-manifest.json"
+DEFAULT_MANIFEST_URL="https://github.com/psewdon1m/sindri/releases/download/sindri-current/sindri-release-manifest.json"
 
 require_root() {
   [ "$(id -u)" -eq 0 ] || { echo "Sindri installation must run as root." >&2; exit 4; }

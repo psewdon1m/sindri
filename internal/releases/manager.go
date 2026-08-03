@@ -19,7 +19,7 @@ import (
 
 const (
 	maxDownloadBytes   = 4 << 20
-	defaultManifestURL = "https://github.com/psewdon1m/exocortex-sindri/releases/download/sindri-current/sindri-release-manifest.json"
+	defaultManifestURL = "https://github.com/psewdon1m/sindri/releases/download/sindri-current/sindri-release-manifest.json"
 )
 
 type Installer struct {
