@@ -3,10 +3,15 @@
 Sindri is an independent local CLI. It does not contact Kernel and does not
 install, update, or remove Agent Node.
 
+Install the current prebuilt Debian package with one command:
+
 ```bash
-cd exocortex-sindri
-sudo sh ./install.sh install
+curl -fsSL https://raw.githubusercontent.com/psewdon1m/sindri/main/install.sh | sudo sh -s -- install
 ```
+
+The VPS does not need Go, Make or a source checkout. The installer validates
+Ubuntu/amd64, downloads the current release manifest and package over HTTPS,
+checks the package SHA-256, installs it through APT and initializes Sindri.
 
 Sindri discovers only its own releases. The built-in URL points to
 `sindri-release-manifest.json`; that manifest contains Sindri's repository URL,
@@ -15,5 +20,5 @@ are not stored in local ENV. `SINDRI_MANIFEST_URL` is reserved for an emergency
 release mirror.
 
 ```bash
-sindri update
+sudo sindri update
 ```

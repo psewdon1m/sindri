@@ -2,8 +2,6 @@
 set -eu
 
 ACTION="${1:-install}"
-ROOT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" 2>/dev/null && pwd)
-VERSION="${VERSION:-1.0.0-dev}"
 DEFAULT_MANIFEST_URL="https://github.com/psewdon1m/sindri/releases/download/sindri-current/sindri-release-manifest.json"
 
 require_root() {
@@ -19,74 +17,55 @@ validate_ubuntu() {
   [ "$(uname -m)" = "x86_64" ] || { echo "Sindri currently supports amd64 only." >&2; exit 3; }
 }
 
-bootstrap_source() {
-  apt-get update
-  DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl git python3
-  manifest_url="${SINDRI_MANIFEST_URL:-$DEFAULT_MANIFEST_URL}"
-  tmp=$(mktemp -d)
-  trap 'rm -rf "$tmp"' EXIT INT TERM
-  manifest="$tmp/manifest.json"
-  curl -fL --retry 2 --connect-timeout 10 "$manifest_url" -o "$manifest"
+download_package() {
+  temporary=$1
+  manifest="$temporary/manifest.json"
+  curl -fsSL --retry 3 --connect-timeout 10 "${SINDRI_MANIFEST_URL:-$DEFAULT_MANIFEST_URL}" -o "$manifest"
   fields=$(python3 - "$manifest" <<'PY'
-import json
-import sys
-
+import json, re, sys
+from urllib.parse import urlparse
 with open(sys.argv[1], encoding="utf-8") as handle:
     manifest = json.load(handle)
-repository = manifest.get("repository") or {}
-installer = manifest.get("installer") or {}
+package = manifest.get("package") or {}
+version = str(manifest.get("version") or "")
+url = str(package.get("url") or "")
+checksum = str(package.get("sha256") or "").removeprefix("sha256:").lower()
 if manifest.get("schema_version") != 1 or manifest.get("product") != "sindri":
     raise SystemExit("Downloaded Sindri release manifest is invalid.")
-url = repository.get("url")
-ref = repository.get("ref") or "main"
-path = repository.get("path")
-installer_sha256 = str(installer.get("sha256") or "").removeprefix("sha256:").lower()
-if (
-    not isinstance(url, str)
-    or not url.startswith("https://")
-    or not isinstance(path, str)
-    or not path
-    or len(installer_sha256) != 64
-    or any(character not in "0123456789abcdef" for character in installer_sha256)
-):
-    raise SystemExit("Sindri release manifest has no valid repository coordinates.")
+if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+    raise SystemExit("Downloaded Sindri release version is invalid.")
+if urlparse(url).scheme != "https" or urlparse(url).hostname != "github.com":
+    raise SystemExit("Sindri package must be downloaded from GitHub over HTTPS.")
+if not re.fullmatch(r"[a-f0-9]{64}", checksum):
+    raise SystemExit("Downloaded Sindri package checksum is invalid.")
+print(version)
 print(url)
-print(ref)
-print(path)
-print(manifest.get("version"))
-print(installer_sha256)
+print(checksum)
 PY
 )
-  repository_url=$(printf '%s\n' "$fields" | sed -n '1p')
-  repository_ref=$(printf '%s\n' "$fields" | sed -n '2p')
-  repository_path=$(printf '%s\n' "$fields" | sed -n '3p')
-  VERSION=$(printf '%s\n' "$fields" | sed -n '4p')
-  installer_sha256=$(printf '%s\n' "$fields" | sed -n '5p')
-  export VERSION
-  git clone --depth 1 --branch "$repository_ref" "$repository_url" "$tmp/source"
-  source_dir="$tmp/source/$repository_path"
-  [ -f "$source_dir/go.mod" ] || { echo "Downloaded Sindri repository is invalid." >&2; exit 14; }
-  actual_installer_sha256=$(sha256sum "$source_dir/install.sh" | awk '{print $1}')
-  [ "$actual_installer_sha256" = "$installer_sha256" ] || {
-    echo "Downloaded Sindri installer checksum does not match the release manifest." >&2
-    exit 14
-  }
-  exec sh "$source_dir/install.sh" "$ACTION"
+  package_url=$(printf '%s\n' "$fields" | sed -n '2p')
+  package_sha=$(printf '%s\n' "$fields" | sed -n '3p')
+  package_path="$temporary/sindri.deb"
+  curl -fsSL --retry 3 --connect-timeout 10 "$package_url" -o "$package_path"
+  printf '%s  %s\n' "$package_sha" "$package_path" | sha256sum -c - >/dev/null
+  printf '%s' "$package_path"
+}
+
+install_sindri() {
+  require_root
+  validate_ubuntu
+  apt-get update
+  DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl python3
+  temporary=$(mktemp -d)
+  trap 'rm -rf "$temporary"' EXIT INT TERM
+  package=$(download_package "$temporary")
+  DEBIAN_FRONTEND=noninteractive apt-get install -y "$package"
+  /usr/bin/sindri init
+  /usr/bin/sindri version
 }
 
 case "$ACTION" in
-  install|update|repair)
-    require_root
-    validate_ubuntu
-    if [ ! -f "$ROOT_DIR/go.mod" ]; then bootstrap_source; fi
-    apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl golang-go make
-    make -C "$ROOT_DIR" deb VERSION="$VERSION"
-    package=$(find "$ROOT_DIR/dist" -maxdepth 1 -name 'sindri_*_amd64.deb' | sort | tail -n 1)
-    [ -n "$package" ] || { echo "Sindri package was not built." >&2; exit 14; }
-    dpkg -i "$package"
-    /usr/bin/sindri init
-    ;;
+  install|update|repair) install_sindri ;;
   status)
     if command -v sindri >/dev/null 2>&1; then
       sindri version
@@ -95,8 +74,6 @@ case "$ACTION" in
       exit 1
     fi
     ;;
-  *)
-    echo "Usage: install.sh install|update|repair|status" >&2
-    exit 2
-    ;;
+  help|--help|-h) echo "Usage: install.sh install|update|repair|status" ;;
+  *) echo "Unknown Sindri installer action: $ACTION" >&2; exit 2 ;;
 esac

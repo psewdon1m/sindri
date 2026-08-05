@@ -16,7 +16,7 @@ import (
 )
 
 var (
-	version         = "1.0.0-dev"
+	version         = "1.1.0"
 	protocolVersion = "1"
 	buildID         = "source"
 )

@@ -22,7 +22,7 @@ Implemented in this repository:
   configuration reload and stop.
 - Production local-user operations: add, delete and password change.
 - Production certificate operations: issue, copy and delete.
-- Self-update from a signed/checksummed release manifest.
+- Self-update from a checksummed HTTPS release manifest.
 - Validation, dry-run plans, operation locks, approval gates, recovery bundles
   and isolated adapter tests for destructive scenarios.
 - Versioned `.deb` packaging and installer/update workflow.
@@ -33,12 +33,24 @@ Release creation and publication are documented in
 Sindri manages only itself. Agent Node lifecycle commands are deliberately not
 part of its registry, and Sindri never reads Kernel.
 
+## Production installation
+
+Sindri has no editable runtime `.env`. Install the latest stable prebuilt
+package with one command:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/psewdon1m/sindri/main/install.sh | sudo sh -s -- install
+```
+
+The installer validates Ubuntu/amd64, downloads the `.deb` over HTTPS, checks
+its SHA-256 and runs `sindri init`. Go is not installed on the target VPS.
+
 ## Build
 
 ```bash
 make test
 make build
-make deb VERSION=1.0.0
+make deb VERSION=1.1.0
 ```
 
 The local development machine must have Go installed. The target runtime does not need Go when installed from the built package.
