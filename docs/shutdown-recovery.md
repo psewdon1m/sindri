@@ -12,5 +12,7 @@ The planned operation:
 
 `sindri recovery` restores the latest shutdown recovery bundle.
 
-The foundation build registers both scenarios and supports test-mode planning. Full host-state capture and restore are future implementation work.
-
+The real operation captures Docker workload state, active services, UFW rules
+and policy in a recovery bundle before applying the lockdown. Only one active
+bundle may exist. `recovery` restores the captured state and marks the bundle
+recovered; a recovered bundle cannot be replayed.

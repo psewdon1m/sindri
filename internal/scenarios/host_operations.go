@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/user"
@@ -49,6 +50,34 @@ type recoveryPointer struct {
 
 var localUsername = regexpUsername()
 
+const (
+	aptCommandTimeout     = 15 * time.Minute
+	serviceCommandTimeout = 45 * time.Second
+	certbotCommandTimeout = 15 * time.Minute
+)
+
+var aptEnvironment = map[string]string{
+	"DEBIAN_FRONTEND":          "noninteractive",
+	"APT_LISTCHANGES_FRONTEND": "none",
+	"NEEDRESTART_MODE":         "a",
+	"RES_OPTIONS":              "attempts:5 timeout:2",
+}
+
+var resolverRetryEnvironment = map[string]string{"RES_OPTIONS": "attempts:5 timeout:2"}
+
+func runApt(ctx core.Context, args ...string) adapters.CommandResult {
+	args = append([]string{"-o", "DPkg::Lock::Timeout=120"}, args...)
+	return adapters.RunWithEnvTimeout(ctx, aptEnvironment, aptCommandTimeout, "apt-get", args...)
+}
+
+func runSystemctl(ctx core.Context, args ...string) adapters.CommandResult {
+	return adapters.RunWithTimeout(ctx, serviceCommandTimeout, "systemctl", args...)
+}
+
+func runCertbot(ctx core.Context, args ...string) adapters.CommandResult {
+	return adapters.RunWithEnvTimeout(ctx, resolverRetryEnvironment, certbotCommandTimeout, "certbot", args...)
+}
+
 func regexpUsername() func(string) bool {
 	return func(value string) bool {
 		if len(value) < 1 || len(value) > 32 {
@@ -73,17 +102,16 @@ func makeReady(ctx core.Context, _ core.Request, _ map[string]interface{}) core.
 	}
 	commands := []struct {
 		step string
-		name string
 		args []string
 	}{
-		{"apt_update", "apt-get", []string{"update"}},
-		{"apt_upgrade", "apt-get", []string{"-y", "upgrade"}},
-		{"install_tools", "apt-get", []string{"install", "-y", "git", "curl", "gnupg"}},
-		{"autoremove", "apt-get", []string{"autoremove", "-y"}},
-		{"autoclean", "apt-get", []string{"autoclean"}},
+		{"apt_update", []string{"update"}},
+		{"apt_upgrade", []string{"-y", "upgrade"}},
+		{"install_tools", []string{"install", "-y", "git", "curl", "gnupg"}},
+		{"autoremove", []string{"autoremove", "-y"}},
+		{"autoclean", []string{"autoclean"}},
 	}
 	for _, command := range commands {
-		run := adapters.Run(ctx, command.name, command.args...)
+		run := runApt(ctx, command.args...)
 		if run.ExitCode != 0 {
 			return commandFailed("MAKE_READY_FAILED", command.step, run)
 		}
@@ -92,7 +120,9 @@ func makeReady(ctx core.Context, _ core.Request, _ map[string]interface{}) core.
 	if err := atomicWrite(journalPath, []byte("[Journal]\nSystemMaxUse=256M\nRuntimeMaxUse=64M\n"), 0644); err != nil {
 		return failed("JOURNAL_CONFIGURATION_FAILED", err.Error(), core.ExitGeneralFailure)
 	}
-	_ = adapters.Run(ctx, "systemctl", "restart", "systemd-journald")
+	if run := runSystemctl(ctx, "restart", "systemd-journald"); run.ExitCode != 0 {
+		return commandFailed("JOURNAL_RESTART_FAILED", "journal_limits", run)
+	}
 	tools := map[string]string{}
 	for label, command := range map[string]string{"git": "git", "curl": "curl", "gpg": "gpg"} {
 		run := adapters.Run(ctx, command, "--version")
@@ -104,7 +134,9 @@ func makeReady(ctx core.Context, _ core.Request, _ map[string]interface{}) core.
 	resources := loadManaged(ctx.Env)
 	resources.Packages = mergeUnique(resources.Packages, "git", "curl", "gnupg")
 	resources.Files = mergeUnique(resources.Files, journalPath)
-	_ = saveManaged(ctx.Env, resources)
+	if err := saveManaged(ctx.Env, resources); err != nil {
+		return managedStateFailure(err)
+	}
 	return success("Base Ubuntu server packages are ready", true, map[string]interface{}{"tools": tools})
 }
 
@@ -115,7 +147,7 @@ func rebootHost(ctx core.Context, _ core.Request, _ map[string]interface{}) core
 	if run := adapters.Run(ctx, "sync"); run.ExitCode != 0 {
 		return commandFailed("SYNC_FAILED", "sync", run)
 	}
-	run := adapters.Run(ctx, "systemctl", "reboot", "--no-block")
+	run := runSystemctl(ctx, "reboot", "--no-block")
 	if run.ExitCode != 0 {
 		return commandFailed("REBOOT_REQUEST_FAILED", "reboot", run)
 	}
@@ -127,7 +159,10 @@ func firewallEnable(ctx core.Context, _ core.Request, _ map[string]interface{}) 
 		return *failure
 	}
 	if !adapters.CommandExists("ufw") {
-		if run := adapters.Run(ctx, "apt-get", "install", "-y", "ufw"); run.ExitCode != 0 {
+		if run := runApt(ctx, "update"); run.ExitCode != 0 {
+			return commandFailed("UFW_INSTALL_FAILED", "apt_update", run)
+		}
+		if run := runApt(ctx, "install", "-y", "ufw"); run.ExitCode != 0 {
 			return commandFailed("UFW_INSTALL_FAILED", "install", run)
 		}
 	}
@@ -168,12 +203,22 @@ func firewallDisable(ctx core.Context, _ core.Request, _ map[string]interface{})
 }
 
 func firewallClose(ctx core.Context, _ core.Request, inputs map[string]interface{}) core.Result {
+	if failure := requireLinuxRoot("FIREWALL_PRECHECK_FAILED"); failure != nil {
+		return *failure
+	}
 	if !adapters.CommandExists("ufw") {
 		return failed("UFW_NOT_FOUND", "UFW is not installed", core.ExitPrecheckFailed)
 	}
 	port := inputs["port"].(int)
 	protocol := inputs["protocol"].(string)
 	rule := fmt.Sprintf("%d/%s", port, protocol)
+	before := adapters.Run(ctx, "ufw", "status")
+	if before.ExitCode != 0 {
+		return commandFailed("FIREWALL_VERIFY_FAILED", "inspect_rule", before)
+	}
+	if !ufwRulePresent(before.Stdout, rule) {
+		return success("Firewall rule is already absent", false, map[string]interface{}{"rule": rule, "ssh_port": containsInt(sshPorts(ctx.Env), port)})
+	}
 	run := adapters.Run(ctx, "ufw", "--force", "delete", "allow", rule)
 	if run.ExitCode != 0 {
 		return commandFailed("UFW_COMMAND_FAILED", "delete_rule", run)
@@ -182,10 +227,23 @@ func firewallClose(ctx core.Context, _ core.Request, inputs map[string]interface
 	if status.ExitCode != 0 {
 		return commandFailed("FIREWALL_VERIFY_FAILED", "verify_rule", status)
 	}
+	if ufwRulePresent(status.Stdout, rule) {
+		return failed("FIREWALL_VERIFY_FAILED", "Firewall rule is still present after deletion", core.ExitVerificationFailed)
+	}
 	return success("Firewall rule removed", true, map[string]interface{}{
 		"rule":     rule,
 		"ssh_port": containsInt(sshPorts(ctx.Env), port),
 	})
+}
+
+func ufwRulePresent(status, rule string) bool {
+	for _, line := range strings.Split(status, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) > 0 && fields[0] == rule {
+			return true
+		}
+	}
+	return false
 }
 
 func dockerInstall(ctx core.Context, _ core.Request, _ map[string]interface{}) core.Result {
@@ -194,11 +252,11 @@ func dockerInstall(ctx core.Context, _ core.Request, _ map[string]interface{}) c
 	}
 	conflicts := []string{"docker.io", "docker-compose", "docker-compose-v2", "docker-doc", "podman-docker", "containerd", "runc"}
 	removeArgs := append([]string{"remove", "-y"}, conflicts...)
-	_ = adapters.Run(ctx, "apt-get", removeArgs...)
-	if run := adapters.Run(ctx, "apt-get", "update"); run.ExitCode != 0 {
+	_ = runApt(ctx, removeArgs...)
+	if run := runApt(ctx, "update"); run.ExitCode != 0 {
 		return commandFailed("DOCKER_INSTALL_FAILED", "apt_update", run)
 	}
-	if run := adapters.Run(ctx, "apt-get", "install", "-y", "ca-certificates", "curl", "gnupg"); run.ExitCode != 0 {
+	if run := runApt(ctx, "install", "-y", "ca-certificates", "curl", "gnupg"); run.ExitCode != 0 {
 		return commandFailed("DOCKER_INSTALL_FAILED", "prerequisites", run)
 	}
 	keyring := hostPath(ctx.Env, "/etc/apt/keyrings/docker.asc")
@@ -222,11 +280,11 @@ func dockerInstall(ctx core.Context, _ core.Request, _ map[string]interface{}) c
 	if err := atomicWrite(repoPath, []byte(repository), 0644); err != nil {
 		return failed("DOCKER_REPOSITORY_FAILED", err.Error(), core.ExitGeneralFailure)
 	}
-	if run := adapters.Run(ctx, "apt-get", "update"); run.ExitCode != 0 {
+	if run := runApt(ctx, "update"); run.ExitCode != 0 {
 		return commandFailed("DOCKER_INSTALL_FAILED", "apt_update_docker", run)
 	}
 	packages := []string{"docker-ce", "docker-ce-cli", "containerd.io", "docker-buildx-plugin", "docker-compose-plugin"}
-	if run := adapters.Run(ctx, "apt-get", append([]string{"install", "-y"}, packages...)...); run.ExitCode != 0 {
+	if run := runApt(ctx, append([]string{"install", "-y"}, packages...)...); run.ExitCode != 0 {
 		return commandFailed("DOCKER_INSTALL_FAILED", "packages", run)
 	}
 	daemonPath := hostPath(ctx.Env, "/etc/docker/daemon.json")
@@ -243,7 +301,7 @@ func dockerInstall(ctx core.Context, _ core.Request, _ map[string]interface{}) c
 	if err := atomicWrite(daemonPath, append(body, '\n'), 0644); err != nil {
 		return failed("DOCKER_CONFIGURATION_FAILED", err.Error(), core.ExitGeneralFailure)
 	}
-	if run := adapters.Run(ctx, "systemctl", "enable", "--now", "docker"); run.ExitCode != 0 {
+	if run := runSystemctl(ctx, "enable", "--now", "docker"); run.ExitCode != 0 {
 		return commandFailed("DOCKER_SERVICE_FAILED", "service", run)
 	}
 	checks := map[string]interface{}{}
@@ -266,7 +324,9 @@ func dockerInstall(ctx core.Context, _ core.Request, _ map[string]interface{}) c
 	resources.Packages = mergeUnique(resources.Packages, packages...)
 	resources.Services = mergeUnique(resources.Services, "docker.service", "containerd.service")
 	resources.Files = mergeUnique(resources.Files, keyring, repoPath, daemonPath)
-	_ = saveManaged(ctx.Env, resources)
+	if err := saveManaged(ctx.Env, resources); err != nil {
+		return managedStateFailure(err)
+	}
 	return success("Docker Engine installed and verified", true, checks)
 }
 
@@ -275,7 +335,7 @@ func dockerUninstall(ctx core.Context, _ core.Request, _ map[string]interface{})
 		return *failure
 	}
 	packages := []string{"docker-ce", "docker-ce-cli", "containerd.io", "docker-buildx-plugin", "docker-compose-plugin", "docker-ce-rootless-extras"}
-	run := adapters.Run(ctx, "apt-get", append([]string{"purge", "-y"}, packages...)...)
+	run := runApt(ctx, append([]string{"purge", "-y"}, packages...)...)
 	if run.ExitCode != 0 {
 		return commandFailed("DOCKER_UNINSTALL_FAILED", "packages", run)
 	}
@@ -285,17 +345,32 @@ func dockerUninstall(ctx core.Context, _ core.Request, _ map[string]interface{})
 	} {
 		_ = os.Remove(path)
 	}
-	_ = adapters.Run(ctx, "apt-get", "update")
+	_ = runApt(ctx, "update")
 	if adapters.CommandExists("docker") {
 		return failed("DOCKER_UNINSTALL_VERIFY_FAILED", "docker remains available in PATH", core.ExitVerificationFailed)
+	}
+	resources := loadManaged(ctx.Env)
+	for _, item := range packages {
+		resources.Packages = removeString(resources.Packages, item)
+	}
+	resources.Services = removeString(removeString(resources.Services, "docker.service"), "containerd.service")
+	for _, path := range []string{
+		hostPath(ctx.Env, "/etc/apt/sources.list.d/docker.list"),
+		hostPath(ctx.Env, "/etc/apt/keyrings/docker.asc"),
+		hostPath(ctx.Env, "/etc/docker/daemon.json"),
+	} {
+		resources.Files = removeString(resources.Files, path)
+	}
+	if err := saveManaged(ctx.Env, resources); err != nil {
+		return managedStateFailure(err)
 	}
 	return success("Docker packages and repository removed; data directories were preserved", true, nil)
 }
 
 const (
-	nginxSiteAvailable = "/etc/nginx/sites-available/exocortex.conf"
-	nginxSiteEnabled   = "/etc/nginx/sites-enabled/exocortex.conf"
-	nginxDefaultSite   = "/etc/nginx/sites-enabled/default"
+	nginxSiteAvailable = "/etc/nginx/sites-available/default"
+	nginxSiteEnabled   = "/etc/nginx/sites-enabled/default"
+	nginxCloudflareIP  = "/etc/nginx/conf.d/sindri-cloudflare-real-ip.conf"
 	nginxCertbotPre    = "/etc/letsencrypt/renewal-hooks/pre/sindri-nginx"
 	nginxCertbotPost   = "/etc/letsencrypt/renewal-hooks/post/sindri-nginx"
 )
@@ -305,33 +380,26 @@ func nginxInstall(ctx core.Context, _ core.Request, _ map[string]interface{}) co
 		return *failure
 	}
 	wasActive := false
-	if adapters.CommandExists("nginx") {
-		wasActive = adapters.Run(ctx, "systemctl", "is-active", "--quiet", "nginx").ExitCode == 0
+	nginxWasInstalled := adapters.CommandExists("nginx")
+	if nginxWasInstalled {
+		wasActive = runSystemctl(ctx, "is-active", "--quiet", "nginx").ExitCode == 0
 	}
-	if run := adapters.Run(ctx, "apt-get", "update"); run.ExitCode != 0 {
-		return commandFailed("NGINX_INSTALL_FAILED", "packages", run)
+	if !nginxWasInstalled {
+		if run := runApt(ctx, "update"); run.ExitCode != 0 {
+			return commandFailed("NGINX_INSTALL_FAILED", "packages", run)
+		}
+		if run := runApt(ctx, "install", "-y", "nginx"); run.ExitCode != 0 {
+			return commandFailed("NGINX_INSTALL_FAILED", "packages", run)
+		}
 	}
-	if run := adapters.Run(ctx, "apt-get", "install", "-y", "nginx", "certbot"); run.ExitCode != 0 {
-		return commandFailed("NGINX_INSTALL_FAILED", "packages", run)
-	}
-	if !adapters.CommandExists("nginx") || !adapters.CommandExists("certbot") {
-		return failed("NGINX_INSTALL_VERIFY_FAILED", "Nginx or Certbot is missing after package installation", core.ExitVerificationFailed)
+	if !adapters.CommandExists("nginx") {
+		return failed("NGINX_INSTALL_VERIFY_FAILED", "Nginx is missing after package installation", core.ExitVerificationFailed)
 	}
 
-	defaultSite := hostPath(ctx.Env, nginxDefaultSite)
-	if info, err := os.Lstat(defaultSite); err == nil {
-		if info.Mode()&os.ModeSymlink == 0 {
-			return failed("NGINX_DEFAULT_SITE_UNMANAGED", defaultSite+" is not a symlink; remove or migrate it manually", core.ExitPrecheckFailed)
-		}
-		if err := os.Remove(defaultSite); err != nil {
-			return failed("NGINX_DEFAULT_SITE_DISABLE_FAILED", err.Error(), core.ExitGeneralFailure)
-		}
-	} else if !os.IsNotExist(err) {
-		return failed("NGINX_DEFAULT_SITE_INSPECT_FAILED", err.Error(), core.ExitGeneralFailure)
-	}
 	for _, directory := range []string{
 		hostPath(ctx.Env, "/etc/nginx/sites-available"),
 		hostPath(ctx.Env, "/etc/nginx/sites-enabled"),
+		hostPath(ctx.Env, "/etc/nginx/conf.d"),
 		filepath.Dir(hostPath(ctx.Env, nginxCertbotPre)),
 		filepath.Dir(hostPath(ctx.Env, nginxCertbotPost)),
 	} {
@@ -339,13 +407,52 @@ func nginxInstall(ctx core.Context, _ core.Request, _ map[string]interface{}) co
 			return failed("NGINX_DIRECTORY_CREATE_FAILED", err.Error(), core.ExitGeneralFailure)
 		}
 	}
+	availablePath := hostPath(ctx.Env, nginxSiteAvailable)
+	if _, err := os.Stat(availablePath); os.IsNotExist(err) {
+		defaultConfig := "server {\n    listen 80 default_server;\n    listen [::]:80 default_server;\n    server_name _;\n    root /var/www/html;\n    index index.html;\n}\n"
+		if err := atomicWrite(availablePath, []byte(defaultConfig), 0644); err != nil {
+			return failed("NGINX_DEFAULT_SITE_CREATE_FAILED", err.Error(), core.ExitGeneralFailure)
+		}
+	} else if err != nil {
+		return failed("NGINX_DEFAULT_SITE_INSPECT_FAILED", err.Error(), core.ExitGeneralFailure)
+	}
+	enabledPath := hostPath(ctx.Env, nginxSiteEnabled)
+	if info, err := os.Lstat(enabledPath); err == nil {
+		if info.Mode()&os.ModeSymlink == 0 {
+			return failed("NGINX_DEFAULT_SITE_UNMANAGED", nginxSiteEnabled+" must be a symlink", core.ExitPrecheckFailed)
+		}
+	} else if os.IsNotExist(err) {
+		if err := os.Symlink("../sites-available/default", enabledPath); err != nil {
+			return failed("NGINX_DEFAULT_SITE_ENABLE_FAILED", err.Error(), core.ExitGeneralFailure)
+		}
+	} else {
+		return failed("NGINX_DEFAULT_SITE_INSPECT_FAILED", err.Error(), core.ExitGeneralFailure)
+	}
+	resolvedSite, err := filepath.EvalSymlinks(enabledPath)
+	if err != nil || filepath.Clean(resolvedSite) != filepath.Clean(availablePath) {
+		return failed("NGINX_DEFAULT_SITE_UNMANAGED", nginxSiteEnabled+" must resolve to "+nginxSiteAvailable, core.ExitPrecheckFailed)
+	}
+
+	cloudflareRanges, cloudflareSource, cloudflareWarning := cloudflareRangeLoader(ctx)
+	if cloudflareWarning != nil {
+		ctx.Log.Write("cloudflare_ranges source=embedded warning=%s", cloudflareWarning)
+	}
+	cloudflarePath := hostPath(ctx.Env, nginxCloudflareIP)
+	previousCloudflare, previousCloudflareErr := os.ReadFile(cloudflarePath)
+	cloudflareExisted := previousCloudflareErr == nil
+	if previousCloudflareErr != nil && !os.IsNotExist(previousCloudflareErr) {
+		return failed("NGINX_CLOUDFLARE_CONFIG_FAILED", previousCloudflareErr.Error(), core.ExitGeneralFailure)
+	}
+	if err := atomicWrite(cloudflarePath, cloudflareRealIPConfig(cloudflareRanges, cloudflareSource), 0644); err != nil {
+		return failed("NGINX_CLOUDFLARE_CONFIG_FAILED", err.Error(), core.ExitGeneralFailure)
+	}
 
 	preHook := `#!/bin/sh
 set -eu
 marker=/run/sindri-nginx-certbot-was-running
 if systemctl is-active --quiet nginx; then
   : >"$marker"
-  systemctl stop nginx
+  timeout 45s systemctl stop nginx
 fi
 `
 	postHook := `#!/bin/sh
@@ -353,7 +460,7 @@ set -eu
 marker=/run/sindri-nginx-certbot-was-running
 if [ -f "$marker" ]; then
   rm -f "$marker"
-  systemctl start nginx
+  timeout 45s systemctl start nginx
 fi
 `
 	prePath := hostPath(ctx.Env, nginxCertbotPre)
@@ -364,16 +471,42 @@ fi
 	if err := atomicWrite(postPath, []byte(postHook), 0755); err != nil {
 		return failed("NGINX_CERTBOT_HOOK_FAILED", err.Error(), core.ExitGeneralFailure)
 	}
+	if configTest := adapters.RunWithTimeout(ctx, serviceCommandTimeout, "nginx", "-t"); configTest.ExitCode != 0 {
+		if cloudflareExisted {
+			_ = atomicWrite(cloudflarePath, previousCloudflare, 0644)
+		} else {
+			_ = os.Remove(cloudflarePath)
+		}
+		return commandFailed("NGINX_CONFIG_INVALID", "cloudflare_real_ip", configTest)
+	}
+	configDump := adapters.RunWithTimeout(ctx, serviceCommandTimeout, "nginx", "-T")
+	configText := configDump.Stdout + "\n" + configDump.Stderr
+	if configDump.ExitCode != 0 || !strings.Contains(configText, nginxCloudflareIP) || !strings.Contains(configText, "real_ip_header CF-Connecting-IP;") {
+		if cloudflareExisted {
+			_ = atomicWrite(cloudflarePath, previousCloudflare, 0644)
+		} else {
+			_ = os.Remove(cloudflarePath)
+		}
+		if configDump.ExitCode != 0 {
+			return commandFailed("NGINX_CONFIG_INVALID", "cloudflare_real_ip_include", configDump)
+		}
+		return failed("NGINX_CLOUDFLARE_CONFIG_NOT_INCLUDED", nginxCloudflareIP+" is not included by nginx.conf", core.ExitVerificationFailed)
+	}
 
 	// Ubuntu can start Nginx automatically after a fresh apt installation. Keep
 	// that new service stopped until the operator has issued certificates and
-	// created the shared site, but never interrupt an already active Nginx.
-	if !wasActive {
-		if run := adapters.Run(ctx, "systemctl", "stop", "nginx"); run.ExitCode != 0 {
+	// created the shared site. Apply refreshed proxy ranges to an existing
+	// service with a zero-downtime reload.
+	if wasActive {
+		if run := runSystemctl(ctx, "reload", "nginx"); run.ExitCode != 0 {
+			return commandFailed("NGINX_RELOAD_FAILED", "cloudflare_real_ip", run)
+		}
+	} else {
+		if run := runSystemctl(ctx, "stop", "nginx"); run.ExitCode != 0 {
 			return commandFailed("NGINX_SERVICE_FAILED", "service", run)
 		}
 	}
-	if run := adapters.Run(ctx, "systemctl", "enable", "nginx"); run.ExitCode != 0 {
+	if run := runSystemctl(ctx, "enable", "nginx"); run.ExitCode != 0 {
 		return commandFailed("NGINX_SERVICE_FAILED", "service", run)
 	}
 	version := adapters.Run(ctx, "nginx", "-v")
@@ -386,20 +519,29 @@ fi
 	}
 
 	resources := loadManaged(ctx.Env)
-	resources.Packages = mergeUnique(resources.Packages, "nginx", "certbot")
+	resources.Packages = mergeUnique(resources.Packages, "nginx")
 	resources.Services = mergeUnique(resources.Services, "nginx.service")
-	resources.Files = mergeUnique(resources.Files, prePath, postPath)
-	_ = saveManaged(ctx.Env, resources)
-	message := "Shared host Nginx installed and left stopped for configuration"
+	resources.Files = mergeUnique(resources.Files, cloudflarePath, prePath, postPath)
+	if err := saveManaged(ctx.Env, resources); err != nil {
+		return managedStateFailure(err)
+	}
+	message := "Shared host Nginx installed with the default site and left stopped"
 	if wasActive {
-		message = "Shared host Nginx dependencies installed; the existing active service was not interrupted"
+		message = "Shared host Nginx updated and reloaded without interrupting the active service"
+	}
+	next := "Edit /etc/nginx/sites-available/default, issue certificates if needed, then run sindri nginx start"
+	if wasActive {
+		next = "Cloudflare proxy ranges are active; use sindri nginx reload after future site changes"
 	}
 	return success(message, true, map[string]interface{}{
 		"version":           versionText,
 		"active":            wasActive,
 		"site_available":    nginxSiteAvailable,
 		"site_enabled_path": nginxSiteEnabled,
-		"next":              "Issue certificates, create exocortex.conf, then run sindri nginx start",
+		"cloudflare_real_ip": map[string]interface{}{
+			"config": nginxCloudflareIP, "ranges": len(cloudflareRanges), "source": cloudflareSource,
+		},
+		"next": next,
 	})
 }
 
@@ -420,17 +562,19 @@ func nginxStatus(ctx core.Context, _ core.Request, _ map[string]interface{}) cor
 	if configTest.ExitCode != 0 {
 		configError = strings.TrimSpace(configTest.Stderr)
 	}
-	active := adapters.Run(ctx, "systemctl", "is-active", "--quiet", "nginx").ExitCode == 0
+	active := runSystemctl(ctx, "is-active", "--quiet", "nginx").ExitCode == 0
 	_, siteError := os.Stat(hostPath(ctx.Env, nginxSiteEnabled))
+	_, cloudflareError := os.Stat(hostPath(ctx.Env, nginxCloudflareIP))
 	return success("Shared host Nginx status collected", false, map[string]interface{}{
-		"installed":         true,
-		"active":            active,
-		"config_valid":      configTest.ExitCode == 0,
-		"config_error":      configError,
-		"version":           versionText,
-		"site_enabled":      siteError == nil,
-		"site_available":    nginxSiteAvailable,
-		"site_enabled_path": nginxSiteEnabled,
+		"installed":                     true,
+		"active":                        active,
+		"config_valid":                  configTest.ExitCode == 0,
+		"config_error":                  configError,
+		"version":                       versionText,
+		"site_enabled":                  siteError == nil,
+		"site_available":                nginxSiteAvailable,
+		"site_enabled_path":             nginxSiteEnabled,
+		"cloudflare_real_ip_configured": cloudflareError == nil,
 	})
 }
 
@@ -447,10 +591,10 @@ func nginxStart(ctx core.Context, _ core.Request, _ map[string]interface{}) core
 	if run := adapters.Run(ctx, "nginx", "-t"); run.ExitCode != 0 {
 		return commandFailed("NGINX_CONFIG_INVALID", "config_test", run)
 	}
-	if run := adapters.Run(ctx, "systemctl", "enable", "--now", "nginx"); run.ExitCode != 0 {
+	if run := runSystemctl(ctx, "enable", "--now", "nginx"); run.ExitCode != 0 {
 		return commandFailed("NGINX_START_FAILED", "service", run)
 	}
-	if run := adapters.Run(ctx, "systemctl", "is-active", "--quiet", "nginx"); run.ExitCode != 0 {
+	if run := runSystemctl(ctx, "is-active", "--quiet", "nginx"); run.ExitCode != 0 {
 		return commandFailed("NGINX_START_VERIFY_FAILED", "verify", run)
 	}
 	return success("Shared host Nginx is running", true, map[string]interface{}{"config": nginxSiteAvailable})
@@ -469,10 +613,10 @@ func nginxReload(ctx core.Context, _ core.Request, _ map[string]interface{}) cor
 	if run := adapters.Run(ctx, "nginx", "-t"); run.ExitCode != 0 {
 		return commandFailed("NGINX_CONFIG_INVALID", "config_test", run)
 	}
-	if run := adapters.Run(ctx, "systemctl", "reload", "nginx"); run.ExitCode != 0 {
+	if run := runSystemctl(ctx, "reload", "nginx"); run.ExitCode != 0 {
 		return commandFailed("NGINX_RELOAD_FAILED", "reload", run)
 	}
-	if run := adapters.Run(ctx, "systemctl", "is-active", "--quiet", "nginx"); run.ExitCode != 0 {
+	if run := runSystemctl(ctx, "is-active", "--quiet", "nginx"); run.ExitCode != 0 {
 		return commandFailed("NGINX_RELOAD_VERIFY_FAILED", "verify", run)
 	}
 	return success("Shared host Nginx reloaded", true, nil)
@@ -485,10 +629,10 @@ func nginxStop(ctx core.Context, _ core.Request, _ map[string]interface{}) core.
 	if !adapters.CommandExists("nginx") {
 		return success("Nginx is not installed", false, map[string]interface{}{"installed": false})
 	}
-	if run := adapters.Run(ctx, "systemctl", "stop", "nginx"); run.ExitCode != 0 {
+	if run := runSystemctl(ctx, "stop", "nginx"); run.ExitCode != 0 {
 		return commandFailed("NGINX_STOP_FAILED", "service", run)
 	}
-	if adapters.Run(ctx, "systemctl", "is-active", "--quiet", "nginx").ExitCode == 0 {
+	if runSystemctl(ctx, "is-active", "--quiet", "nginx").ExitCode == 0 {
 		return failed("NGINX_STOP_VERIFY_FAILED", "Nginx still reports an active state", core.ExitVerificationFailed)
 	}
 	return success("Shared host Nginx stopped", true, nil)
@@ -636,6 +780,13 @@ func dockerComposeAction(ctx core.Context, path string, up bool) core.Result {
 		if run.ExitCode != 0 {
 			return commandFailed("DOCKER_COMPOSE_FAILED", "compose", run)
 		}
+		if up {
+			resources := loadManaged(ctx.Env)
+			resources.Projects = mergeUnique(resources.Projects, absolute)
+			if err := saveManaged(ctx.Env, resources); err != nil {
+				return managedStateFailure(err)
+			}
+		}
 		return success("Docker Compose project updated", true, map[string]interface{}{"compose_file": compose, "operation": map[bool]string{true: "up", false: "down"}[up]})
 	}
 	filter := "-qf"
@@ -689,7 +840,10 @@ func userAdd(ctx core.Context, _ core.Request, inputs map[string]interface{}) co
 	}
 	resources := loadManaged(ctx.Env)
 	resources.Users = mergeUnique(resources.Users, username)
-	_ = saveManaged(ctx.Env, resources)
+	if err := saveManaged(ctx.Env, resources); err != nil {
+		_ = adapters.Run(ctx, "userdel", "--remove", username)
+		return managedStateFailure(err)
+	}
 	id := adapters.Run(ctx, "id", username)
 	groups := adapters.Run(ctx, "groups", username)
 	return success("Local user created", true, map[string]interface{}{"username": username, "id": id.Stdout, "groups": groups.Stdout})
@@ -716,7 +870,9 @@ func userDelete(ctx core.Context, _ core.Request, inputs map[string]interface{})
 		return commandFailed("USER_DELETE_FAILED", "userdel", run)
 	}
 	resources.Users = removeString(resources.Users, username)
-	_ = saveManaged(ctx.Env, resources)
+	if err := saveManaged(ctx.Env, resources); err != nil {
+		return managedStateFailure(err)
+	}
 	return success("Local user deleted", true, map[string]interface{}{"username": username, "home_removed": inputs["remove_home"]})
 }
 
@@ -739,6 +895,9 @@ func userPasswordChange(ctx core.Context, _ core.Request, inputs map[string]inte
 }
 
 func certificateDelete(ctx core.Context, _ core.Request, inputs map[string]interface{}) core.Result {
+	if failure := requireLinuxRoot("CERTIFICATE_DELETE_PRECHECK_FAILED"); failure != nil {
+		return *failure
+	}
 	name := strings.TrimSpace(inputs["certificate"].(string))
 	if !certificateName.MatchString(name) {
 		return failed("CERTIFICATE_NAME_INVALID", "Certificate name is invalid", core.ExitInvalidCommand)
@@ -746,7 +905,7 @@ func certificateDelete(ctx core.Context, _ core.Request, inputs map[string]inter
 	if !adapters.CommandExists("certbot") {
 		return failed("CERTBOT_NOT_FOUND", "Certbot is not installed", core.ExitPrecheckFailed)
 	}
-	run := adapters.Run(ctx, "certbot", "delete", "--cert-name", name, "--non-interactive")
+	run := runCertbot(ctx, "delete", "--cert-name", name, "--non-interactive")
 	if run.ExitCode != 0 {
 		return commandFailed("CERTIFICATE_DELETE_FAILED", "certbot", run)
 	}
@@ -762,6 +921,12 @@ func shutdownHost(ctx core.Context, _ core.Request, _ map[string]interface{}) co
 	}
 	if err := core.EnsureRuntimeDirs(ctx.Env); err != nil {
 		return failed("RECOVERY_BUNDLE_FAILED", err.Error(), core.ExitGeneralFailure)
+	}
+	if body, err := os.ReadFile(filepath.Join(ctx.Env.DataDir, "recovery", "active.json")); err == nil {
+		var existing recoveryPointer
+		if json.Unmarshal(body, &existing) == nil && (existing.Status == "active" || existing.Status == "applying") {
+			return failed("SHUTDOWN_ALREADY_ACTIVE", "A shutdown recovery state is already active; run sindri recovery first", core.ExitPrecheckFailed)
+		}
 	}
 	bundle := captureRecoveryBundle(ctx)
 	body, err := json.MarshalIndent(bundle, "", "  ")
@@ -789,7 +954,10 @@ func shutdownHost(ctx core.Context, _ core.Request, _ map[string]interface{}) co
 		return *failure
 	}
 	pointer.Status = "active"
-	_ = writeRecoveryPointer(ctx.Env, pointer)
+	if err := writeRecoveryPointer(ctx.Env, pointer); err != nil {
+		_ = restoreRecoveryBundle(ctx, bundle)
+		return failed("RECOVERY_BUNDLE_FAILED", err.Error(), core.ExitGeneralFailure)
+	}
 	return success("Reversible network lockdown is active", true, map[string]interface{}{"recovery_bundle": bundlePath, "checksum": checksum, "ssh_ports": bundle.SSHPorts})
 }
 
@@ -805,7 +973,9 @@ func recoverHost(ctx core.Context, _ core.Request, _ map[string]interface{}) cor
 		return *restoreFailure
 	}
 	pointer.Status = "recovered"
-	_ = writeRecoveryPointer(ctx.Env, pointer)
+	if err := writeRecoveryPointer(ctx.Env, pointer); err != nil {
+		return managedStateFailure(err)
+	}
 	return success("Previous network and service state restored", true, map[string]interface{}{"recovery_bundle": pointer.BundlePath})
 }
 
@@ -833,11 +1003,13 @@ func exterminatusHost(ctx core.Context, req core.Request, _ map[string]interface
 	failures := []string{}
 	if result := dockerClean(ctx, req, nil); result.Status == core.StatusFailed {
 		failures = append(failures, "docker resources: "+result.Error.Message)
-	} else {
+	} else if result.Changed {
 		deleted = append(deleted, "Docker resources")
+	} else {
+		skipped = append(skipped, "Docker resources (not installed or already empty)")
 	}
 	for _, name := range certbotCertificateNames(ctx.Env) {
-		if run := adapters.Run(ctx, "certbot", "delete", "--cert-name", name, "--non-interactive"); run.ExitCode != 0 {
+		if run := runCertbot(ctx, "delete", "--cert-name", name, "--non-interactive"); run.ExitCode != 0 {
 			failures = append(failures, "certificate "+name)
 		} else {
 			deleted = append(deleted, "certificate "+name)
@@ -855,25 +1027,31 @@ func exterminatusHost(ctx core.Context, req core.Request, _ map[string]interface
 		}
 	}
 	for _, project := range resources.Projects {
-		if err := safeRemoveManaged(project); err != nil {
+		removed, err := safeRemoveManaged(project)
+		if err != nil {
 			failures = append(failures, "project "+project+": "+err.Error())
-		} else {
+		} else if removed {
 			deleted = append(deleted, "project "+project)
+		} else {
+			skipped = append(skipped, "project "+project+" (already absent)")
 		}
 	}
-	if len(resources.Packages) > 0 {
-		run := adapters.Run(ctx, "apt-get", append([]string{"purge", "-y"}, resources.Packages...)...)
+	for _, packageName := range resources.Packages {
+		run := runApt(ctx, "purge", "-y", packageName)
 		if run.ExitCode != 0 {
-			failures = append(failures, "managed packages")
+			failures = append(failures, "package "+packageName+": "+firstLine(run.Stderr))
 		} else {
-			deleted = append(deleted, "managed packages")
+			deleted = append(deleted, "package "+packageName)
 		}
 	}
 	for _, path := range resources.Files {
-		if err := safeRemoveManaged(path); err != nil {
+		removed, err := safeRemoveManaged(path)
+		if err != nil {
 			failures = append(failures, "file "+path+": "+err.Error())
-		} else {
+		} else if removed {
 			deleted = append(deleted, "file "+path)
+		} else {
+			skipped = append(skipped, "file "+path+" (already absent)")
 		}
 	}
 	for _, path := range []string{
@@ -882,10 +1060,13 @@ func exterminatusHost(ctx core.Context, req core.Request, _ map[string]interface
 		hostPath(ctx.Env, "/etc/docker"),
 	} {
 		if containsString(resources.Packages, "docker-ce") {
-			if err := safeRemoveManaged(path); err != nil {
+			removed, err := safeRemoveManaged(path)
+			if err != nil {
 				failures = append(failures, path)
-			} else {
+			} else if removed {
 				deleted = append(deleted, path)
+			} else {
+				skipped = append(skipped, path+" (already absent)")
 			}
 		}
 	}
@@ -900,6 +1081,9 @@ func exterminatusHost(ctx core.Context, req core.Request, _ map[string]interface
 	}
 	_ = adapters.Run(ctx, "sysctl", "-w", "net.ipv4.icmp_echo_ignore_all=1")
 	_ = adapters.Run(ctx, "sync")
+	if run := runSystemctl(ctx, "poweroff", "--no-block"); run.ExitCode != 0 {
+		failures = append(failures, "poweroff: "+firstLine(run.Stderr))
+	}
 	report := map[string]interface{}{
 		"inventory": inventoryPath,
 		"deleted":   deleted,
@@ -910,7 +1094,6 @@ func exterminatusHost(ctx core.Context, req core.Request, _ map[string]interface
 			"Reimage or destroy the VPS through the hosting provider",
 		},
 	}
-	_ = adapters.Run(ctx, "systemctl", "poweroff", "--no-block")
 	status := core.StatusPartial
 	exitCode := core.ExitProviderActionRequired
 	if len(failures) > 0 {
@@ -946,7 +1129,7 @@ func captureRecoveryBundle(ctx core.Context) recoveryBundle {
 	}
 	resources := loadManaged(ctx.Env)
 	for _, service := range resources.Services {
-		if adapters.Run(ctx, "systemctl", "is-active", "--quiet", service).ExitCode == 0 {
+		if runSystemctl(ctx, "is-active", "--quiet", service).ExitCode == 0 {
 			bundle.RunningServices = append(bundle.RunningServices, service)
 		}
 	}
@@ -961,7 +1144,7 @@ func applyLockdown(ctx core.Context, bundle recoveryBundle) *core.Result {
 		}
 	}
 	for _, service := range bundle.RunningServices {
-		if run := adapters.Run(ctx, "systemctl", "stop", service); run.ExitCode != 0 {
+		if run := runSystemctl(ctx, "stop", service); run.ExitCode != 0 {
 			result := commandFailed("LOCKDOWN_FAILED", "services", run)
 			return &result
 		}
@@ -1024,7 +1207,7 @@ func restoreRecoveryBundle(ctx core.Context, bundle recoveryBundle) *core.Result
 		_ = adapters.Run(ctx, "sysctl", "-w", "net.ipv6.icmp.echo_ignore_all="+bundle.IPv6ICMPIgnore)
 	}
 	for _, service := range bundle.RunningServices {
-		if run := adapters.Run(ctx, "systemctl", "start", service); run.ExitCode != 0 {
+		if run := runSystemctl(ctx, "start", service); run.ExitCode != 0 {
 			result := commandFailed("RECOVERY_FAILED", "services", run)
 			return &result
 		}
@@ -1048,6 +1231,10 @@ func loadActiveRecovery(env core.Environment) (recoveryPointer, recoveryBundle, 
 	}
 	if err := json.Unmarshal(body, &pointer); err != nil || pointer.BundlePath == "" {
 		result := failed("RECOVERY_STATE_CORRUPTED", "Recovery pointer is invalid", core.ExitRecoveryStateCorrupted)
+		return pointer, bundle, &result
+	}
+	if pointer.Status != "active" {
+		result := failed("RECOVERY_STATE_INACTIVE", "No active shutdown recovery state exists", core.ExitRecoveryStateMissing)
 		return pointer, bundle, &result
 	}
 	bundleBody, err := os.ReadFile(pointer.BundlePath)
@@ -1226,17 +1413,27 @@ func diskFreeBytes(path string) (uint64, error) {
 	return stats.Bavail * uint64(stats.Bsize), nil
 }
 
-func safeRemoveManaged(path string) error {
+func safeRemoveManaged(path string) (bool, error) {
 	absolute, err := filepath.Abs(path)
 	if err != nil {
-		return err
+		return false, err
+	}
+	info, err := os.Lstat(absolute)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return false, errors.New("refusing to recursively remove a symbolic link")
 	}
 	resolved, err := filepath.EvalSymlinks(absolute)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil
+			return false, nil
 		}
-		return err
+		return false, err
 	}
 	forbidden := map[string]bool{
 		"/": true, "/boot": true, "/dev": true, "/proc": true, "/sys": true,
@@ -1244,9 +1441,12 @@ func safeRemoveManaged(path string) error {
 		"/lib": true, "/lib64": true, "/var": true,
 	}
 	if forbidden[filepath.Clean(resolved)] {
-		return fmt.Errorf("protected system path")
+		return false, fmt.Errorf("protected system path")
 	}
-	return os.RemoveAll(resolved)
+	if err := os.RemoveAll(resolved); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func commandFailed(code, step string, run adapters.CommandResult) core.Result {
@@ -1257,7 +1457,21 @@ func commandFailed(code, step string, run adapters.CommandResult) core.Result {
 	if message == "" {
 		message = fmt.Sprintf("%s exited with code %d", strings.Join(run.Command, " "), run.ExitCode)
 	}
-	return failed(code, step+": "+message, core.ExitGeneralFailure)
+	exitCode := core.ExitGeneralFailure
+	if run.TimedOut {
+		exitCode = core.ExitTimeout
+	}
+	return failed(code, step+": "+message, exitCode)
+}
+
+func managedStateFailure(err error) core.Result {
+	return core.Result{
+		Status:   core.StatusPartial,
+		Changed:  true,
+		Message:  "The system operation completed, but Sindri could not persist its managed-resource inventory",
+		Error:    &core.ErrorInfo{Code: "MANAGED_STATE_WRITE_FAILED", Message: err.Error()},
+		ExitCode: core.ExitPartialSuccess,
+	}
 }
 
 func failed(code, message string, exitCode int) core.Result {

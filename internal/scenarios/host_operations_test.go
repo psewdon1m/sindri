@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"sindri/internal/core"
@@ -70,6 +71,11 @@ func TestProductionHandlersAgainstIsolatedSystemAdapters(t *testing.T) {
 		t.Skip("production adapter smoke test requires a root Linux test container")
 	}
 	env := testEnvironment(t)
+	originalCloudflareLoader := cloudflareRangeLoader
+	cloudflareRangeLoader = func(context.Context) ([]string, string, error) {
+		return append([]string(nil), embeddedCloudflareRanges...), "test", nil
+	}
+	t.Cleanup(func() { cloudflareRangeLoader = originalCloudflareLoader })
 	fakeBin := installFakeSystemCommands(t)
 	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("FAKE_STATE_DIR", filepath.Join(env.DataDir, "fake-state"))
@@ -91,9 +97,18 @@ func TestProductionHandlersAgainstIsolatedSystemAdapters(t *testing.T) {
 	assertResult(t, "docker logs", dockerLogs(ctx, core.Request{}, map[string]interface{}{"lines": 50}), core.StatusSuccess)
 	assertResult(t, "docker clean", dockerClean(ctx, core.Request{}, nil), core.StatusSuccess)
 	assertResult(t, "nginx install", nginxInstall(ctx, core.Request{}, nil), core.StatusSuccess)
+	cloudflareConfig, err := os.ReadFile(hostPath(env, nginxCloudflareIP))
+	if err != nil || !strings.Contains(string(cloudflareConfig), "real_ip_header CF-Connecting-IP;") {
+		t.Fatalf("Cloudflare real-IP configuration was not installed: %q, %v", cloudflareConfig, err)
+	}
+	if !containsString(loadManaged(env).Files, hostPath(env, nginxCloudflareIP)) {
+		t.Fatal("Cloudflare real-IP configuration was not tracked")
+	}
 	writeFile(t, hostPath(env, nginxSiteAvailable), "server { listen 80; }\n")
-	if err := os.Symlink("../sites-available/exocortex.conf", hostPath(env, nginxSiteEnabled)); err != nil {
-		t.Fatal(err)
+	if _, err := os.Lstat(hostPath(env, nginxSiteEnabled)); os.IsNotExist(err) {
+		if err := os.Symlink("../sites-available/default", hostPath(env, nginxSiteEnabled)); err != nil {
+			t.Fatal(err)
+		}
 	}
 	assertResult(t, "nginx start", nginxStart(ctx, core.Request{}, nil), core.StatusSuccess)
 	assertResult(t, "nginx status", nginxStatus(ctx, core.Request{}, nil), core.StatusSuccess)
@@ -116,9 +131,17 @@ func TestProductionHandlersAgainstIsolatedSystemAdapters(t *testing.T) {
 	assertResult(t, "password change", userPasswordChange(ctx, core.Request{}, map[string]interface{}{"username": "sindri-test", "password": "another-long-password"}), core.StatusSuccess)
 	assertResult(t, "user delete", userDelete(ctx, core.Request{}, map[string]interface{}{"username": "sindri-test", "remove_home": true}), core.StatusSuccess)
 	assertResult(t, "certificate delete", certificateDelete(ctx, core.Request{}, map[string]interface{}{"certificate": "node.example.test"}), core.StatusSuccess)
+	if value, err := os.ReadFile(filepath.Join(os.Getenv("FAKE_STATE_DIR"), "certbot-res-options")); err != nil || string(value) != "attempts:5 timeout:2\n" {
+		t.Fatalf("Certbot DNS retry options were not applied: %q, %v", value, err)
+	}
 
 	assertResult(t, "shutdown", shutdownHost(ctx, core.Request{}, nil), core.StatusSuccess)
 	assertResult(t, "recovery", recoverHost(ctx, core.Request{}, nil), core.StatusSuccess)
+	replayedRecovery := recoverHost(ctx, core.Request{}, nil)
+	assertResult(t, "replayed recovery", replayedRecovery, core.StatusFailed)
+	if replayedRecovery.Error == nil || replayedRecovery.Error.Code != "RECOVERY_STATE_INACTIVE" {
+		t.Fatalf("recovered bundle was replayable: %#v", replayedRecovery)
+	}
 
 	hostname, _ := os.Hostname()
 	exterminatus := exterminatusHost(ctx, core.Request{
@@ -142,7 +165,115 @@ func TestDockerUninstallVerifiesTheBinaryWasRemoved(t *testing.T) {
 	writeExecutable(t, filepath.Join(fakeBin, "apt-get"), "#!/bin/sh\nexit 0\n")
 	t.Setenv("PATH", fakeBin)
 	ctx := core.Context{Context: context.Background(), Env: env}
+	resources := managedResources{
+		Packages: []string{"docker-ce", "docker-ce-cli", "unrelated-package"},
+		Services: []string{"docker.service", "containerd.service", "unrelated.service"},
+		Files: []string{
+			hostPath(env, "/etc/apt/sources.list.d/docker.list"),
+			hostPath(env, "/etc/apt/keyrings/docker.asc"),
+			hostPath(env, "/etc/docker/daemon.json"),
+		},
+	}
+	if err := saveManaged(env, resources); err != nil {
+		t.Fatal(err)
+	}
 	assertResult(t, "docker uninstall", dockerUninstall(ctx, core.Request{}, nil), core.StatusSuccess)
+	resources = loadManaged(env)
+	if containsString(resources.Packages, "docker-ce") || containsString(resources.Services, "docker.service") || containsString(resources.Files, hostPath(env, "/etc/docker/daemon.json")) {
+		t.Fatalf("Docker resources remain in managed inventory: %#v", resources)
+	}
+	if !containsString(resources.Packages, "unrelated-package") || !containsString(resources.Services, "unrelated.service") {
+		t.Fatalf("unrelated inventory was removed: %#v", resources)
+	}
+}
+
+func TestCertificateCopyRepairsPrivateKeyModeAndTracksFiles(t *testing.T) {
+	if runtime.GOOS != "linux" || os.Geteuid() != 0 {
+		t.Skip("certificate copy test requires root Linux")
+	}
+	env := testEnvironment(t)
+	ctx := core.Context{Context: context.Background(), Env: env}
+	source := hostPath(env, "/etc/letsencrypt/live/example.test")
+	for _, name := range []string{"fullchain.pem", "privkey.pem", "cert.pem", "chain.pem"} {
+		writeFile(t, filepath.Join(source, name), "fixture-"+name+"\n")
+	}
+	destination := hostPath(env, "/opt/certificate-copy")
+	writeFile(t, filepath.Join(destination, "privkey.pem"), "old-mode\n")
+	if err := os.Chmod(filepath.Join(destination, "privkey.pem"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	result := certificateCopy(ctx, core.Request{}, map[string]interface{}{"certificate": "example.test", "destination": "/opt/certificate-copy"})
+	assertResult(t, "certificate copy", result, core.StatusSuccess)
+	info, err := os.Stat(filepath.Join(destination, "privkey.pem"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0600 {
+		t.Fatalf("private key mode = %o, want 600", info.Mode().Perm())
+	}
+	resources := loadManaged(env)
+	if !containsString(resources.Files, filepath.Join(destination, "privkey.pem")) {
+		t.Fatalf("copied private key was not tracked: %#v", resources.Files)
+	}
+}
+
+func TestCertificateNewInstallsCertbotAfterConnectivityPreflight(t *testing.T) {
+	if runtime.GOOS != "linux" || os.Geteuid() != 0 {
+		t.Skip("certificate issuance adapter test requires root Linux")
+	}
+	env := testEnvironment(t)
+	writeFile(t, hostPath(env, "/etc/os-release"), "ID=ubuntu\nVERSION_ID=\"24.04\"\n")
+	fakeBin := t.TempDir()
+	template := filepath.Join(t.TempDir(), "certbot-template")
+	writeExecutable(t, template, `#!/bin/sh
+domain=
+previous=
+for argument in "$@"; do
+  if [ "$previous" = "-d" ]; then domain=$argument; fi
+  previous=$argument
+done
+target="${FAKE_HOST_ROOT:?}/etc/letsencrypt/live/$domain"
+/bin/mkdir -p "$target"
+printf fullchain >"$target/fullchain.pem"
+printf private >"$target/privkey.pem"
+printf '%s\n' "${RES_OPTIONS:-}" >"${FAKE_STATE_DIR:?}/certbot-res-options"
+`)
+	writeExecutable(t, filepath.Join(fakeBin, "apt-get"), `#!/bin/sh
+install_certbot=0
+for argument in "$@"; do
+  if [ "$argument" = "certbot" ]; then install_certbot=1; fi
+done
+if [ "$install_certbot" = "1" ]; then
+  /bin/cp "${FAKE_CERTBOT_TEMPLATE:?}" "${FAKE_BIN:?}/certbot"
+  /bin/chmod 0755 "${FAKE_BIN:?}/certbot"
+fi
+exit 0
+`)
+	writeExecutable(t, filepath.Join(fakeBin, "systemctl"), "#!/bin/sh\nexit 1\n")
+	state := filepath.Join(env.DataDir, "fake-cert-state")
+	if err := os.MkdirAll(state, 0750); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeBin)
+	t.Setenv("FAKE_BIN", fakeBin)
+	t.Setenv("FAKE_CERTBOT_TEMPLATE", template)
+	t.Setenv("FAKE_HOST_ROOT", env.HostRoot)
+	t.Setenv("FAKE_STATE_DIR", state)
+	originalCheck := acmeConnectivityCheck
+	acmeConnectivityCheck = func(core.Context, string) (string, error) { return "", nil }
+	t.Cleanup(func() { acmeConnectivityCheck = originalCheck })
+
+	ctx := core.Context{Context: context.Background(), Env: env}
+	result := certificateNew(ctx, core.Request{}, map[string]interface{}{"domain": "service.example.test"})
+	assertResult(t, "certificate issue", result, core.StatusSuccess)
+	resources := loadManaged(env)
+	if !containsString(resources.Packages, "certbot") {
+		t.Fatalf("Certbot package was not tracked: %#v", resources)
+	}
+	options, err := os.ReadFile(filepath.Join(state, "certbot-res-options"))
+	if err != nil || string(options) != "attempts:5 timeout:2\n" {
+		t.Fatalf("Certbot resolver retries were not applied: %q, %v", options, err)
+	}
 }
 
 func testEnvironment(t *testing.T) core.Environment {
@@ -239,9 +370,11 @@ case "$name" in
       "--force disable") printf inactive >"$state/ufw" ;;
       "status"|"status verbose")
         current=$(cat "$state/ufw" 2>/dev/null || printf active)
-        printf 'Status: %s\n22/tcp ALLOW Anywhere\n8080/tcp ALLOW Anywhere\n' "$current"
+        printf 'Status: %s\n22/tcp ALLOW Anywhere\n' "$current"
+        if [ ! -f "$state/ufw-8080-removed" ]; then printf '8080/tcp ALLOW Anywhere\n'; fi
         ;;
       "show added") printf 'ufw allow 22/tcp\nufw allow 8080/tcp\n' ;;
+      *"delete allow 8080/tcp"*) : >"$state/ufw-8080-removed" ;;
     esac
     ;;
   docker)
@@ -284,12 +417,14 @@ case "$name" in
     printf '%s\n' "$credentials" >"$state/last-password"
     ;;
   certbot)
+	printf '%s\n' "${RES_OPTIONS:-}" >"$state/certbot-res-options"
     exit 0
     ;;
   nginx)
     case "$1" in
       -v) printf 'nginx version: nginx/test\n' >&2 ;;
       -t) printf 'nginx configuration test is successful\n' >&2 ;;
+	  -T) printf '# configuration file /etc/nginx/conf.d/sindri-cloudflare-real-ip.conf:\nreal_ip_header CF-Connecting-IP;\n' ;;
     esac
     ;;
 esac

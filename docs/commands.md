@@ -9,7 +9,10 @@ sindri update
 Sindri manages only its own release lifecycle. Agent Node installation,
 updates, repair and removal are handled by Agent Node's installer.
 
-The foundation build registers the command surface required by the technical specification. Read-only commands are implemented first. Change and dangerous commands already pass through the shared registry, validation, test mode and approval boundaries.
+CLI commands prompt for omitted required values. Mutating commands display a
+single fixed progress line, and dangerous commands require an explicit
+interactive confirmation. Scripts and agents should use `sindri machine` for
+JSON requests and responses.
 
 ## Meta
 
@@ -54,11 +57,13 @@ The foundation build registers the command surface required by the technical spe
 - `sindri nginx reload [--test]`
 - `sindri nginx stop [--test]`
 
-`nginx install` installs the Ubuntu Nginx and Certbot packages, disables only
-the distribution's default-site symlink, installs shared standalone-renewal
-hooks and leaves a fresh service stopped. An already active Nginx is never
-interrupted. Create and enable
-`/etc/nginx/sites-available/exocortex.conf` before running `nginx start`.
+`nginx install` installs only the Ubuntu Nginx package, keeps or creates
+`/etc/nginx/sites-available/default`, enables it through
+`/etc/nginx/sites-enabled/default`, installs bounded standalone-renewal hooks
+and configures trusted Cloudflare proxy ranges in
+`/etc/nginx/conf.d/sindri-cloudflare-real-ip.conf`. A fresh service is left
+stopped and an already active Nginx is never interrupted. Package and service
+operations are non-interactive and bounded by timeouts.
 See [nginx.md](nginx.md) for the complete deployment procedure.
 
 ## Users
@@ -72,3 +77,10 @@ See [nginx.md](nginx.md) for the complete deployment procedure.
 - `sindri cert new [domain] [--test]`
 - `sindri cert cp [certificate-name] [destination] [--test]`
 - `sindri cert delete [certificate-name] [--test]`
+
+`cert new` installs Certbot automatically when it is absent. Certificate
+issuance uses standalone HTTP-01 and therefore requires port 80 to be free;
+stop Nginx before issuing the certificate. Before changing packages or calling
+Certbot, Sindri retries DNS resolution for the requested domain and Let's
+Encrypt, then validates the ACME HTTPS directory. Certbot and APT receive
+`RES_OPTIONS="attempts:5 timeout:2"` automatically.

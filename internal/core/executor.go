@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -64,30 +65,43 @@ func Execute(parent context.Context, registry *Registry, env Environment, req Re
 
 	if scenario.Risk == RiskDangerous && !req.Test {
 		hash := planHash(scenario, inputs)
-		if req.Approval != nil && (req.Approval.ApprovalID == "" || req.Approval.PlanHash != hash) {
-			return finish(start, Result{
-				ProtocolVersion: env.ProtocolVersion,
-				RequestID:       req.RequestID,
-				Status:          StatusFailed,
-				Action:          scenario.ID,
-				Error:           &ErrorInfo{Code: "APPROVAL_INVALID", Message: "Approval ID or plan hash is invalid"},
-				ExitCode:        ExitVerificationFailed,
-			})
-		}
 		if req.Approval == nil {
+			record, issueErr := IssueApproval(env, scenario.ID, hash)
+			if issueErr != nil {
+				return finish(start, Result{
+					ProtocolVersion: env.ProtocolVersion,
+					RequestID:       req.RequestID,
+					Status:          StatusFailed,
+					Action:          scenario.ID,
+					Error:           &ErrorInfo{Code: "APPROVAL_STORE_FAILED", Message: issueErr.Error()},
+					ExitCode:        ExitGeneralFailure,
+				})
+			}
 			return finish(start, Result{
 				ProtocolVersion: env.ProtocolVersion,
 				RequestID:       req.RequestID,
 				Status:          StatusApprovalRequired,
 				Action:          scenario.ID,
 				Risk:            scenario.Risk,
-				ApprovalID:      "approval-" + NewShortID(),
+				ApprovalID:      record.ID,
 				PlanHash:        hash,
-				ExpiresAt:       time.Now().Add(5 * time.Minute).Format(time.RFC3339),
+				ExpiresAt:       record.ExpiresAt.Format(time.RFC3339),
 				Plan:            scenario.Steps,
 				ExitCode:        ExitApprovalRequired,
 			})
 		}
+		approvalCleanup, approvalErr := ConsumeApproval(env, req.Approval.ApprovalID, scenario.ID, hash)
+		if approvalErr != nil {
+			return finish(start, Result{
+				ProtocolVersion: env.ProtocolVersion,
+				RequestID:       req.RequestID,
+				Status:          StatusFailed,
+				Action:          scenario.ID,
+				Error:           &ErrorInfo{Code: "APPROVAL_INVALID", Message: approvalErr.Error()},
+				ExitCode:        ExitVerificationFailed,
+			})
+		}
+		defer approvalCleanup()
 	}
 
 	_ = EnsureRuntimeDirs(env)
@@ -155,7 +169,15 @@ func finish(start time.Time, result Result) Result {
 }
 
 func planHash(s Scenario, inputs map[string]interface{}) string {
-	sum := sha256.Sum256([]byte(fmt.Sprintf("%s:%v:%v", s.ID, s.Steps, inputs)))
+	payload, err := json.Marshal(struct {
+		Action string                 `json:"action"`
+		Steps  []StepSpec             `json:"steps"`
+		Inputs map[string]interface{} `json:"inputs"`
+	}{Action: s.ID, Steps: s.Steps, Inputs: inputs})
+	if err != nil {
+		payload = []byte(fmt.Sprintf("%s:%v", s.ID, s.Steps))
+	}
+	sum := sha256.Sum256(payload)
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
@@ -166,6 +188,7 @@ func EnsureRuntimeDirs(env Environment) error {
 		env.ConfigDir,
 		filepath.Join(env.DataDir, "backups"),
 		filepath.Join(env.DataDir, "recovery"),
+		filepath.Join(env.DataDir, "approvals"),
 		filepath.Join(env.LogDir, "runs"),
 	}
 	for _, path := range paths {
@@ -173,5 +196,6 @@ func EnsureRuntimeDirs(env Environment) error {
 			return err
 		}
 	}
+	_ = os.Chmod(filepath.Join(env.DataDir, "approvals"), 0700)
 	return nil
 }

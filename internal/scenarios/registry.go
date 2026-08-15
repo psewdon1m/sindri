@@ -1,12 +1,15 @@
 package scenarios
 
 import (
+	"context"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"strings"
+	"time"
 
 	"sindri/internal/adapters"
 	"sindri/internal/core"
@@ -28,8 +31,9 @@ func NewRegistry(version string, protocolVersion string, buildID string) *core.R
 
 func addNginx(r *core.Registry) {
 	r.Add(hostScenario("nginx.install", []string{"nginx", "install"}, "sindri nginx install", "Install the shared host Nginx", core.RiskChange, []core.StepSpec{
-		{ID: "packages", Name: "Install Nginx and Certbot"},
-		{ID: "default_site", Name: "Disable the distribution default site"},
+		{ID: "packages", Name: "Install Nginx"},
+		{ID: "default_site", Name: "Prepare the distribution default site"},
+		{ID: "cloudflare", Name: "Configure trusted Cloudflare proxy addresses"},
 		{ID: "renewal_hooks", Name: "Install shared Certbot renewal hooks"},
 		{ID: "service", Name: "Enable Nginx without starting it"},
 		{ID: "verify", Name: "Verify the Nginx binary"},
@@ -76,7 +80,14 @@ func addManagedReleaseScenario(r *core.Registry, id string, cli []string, usage,
 			}
 			manifest, output, err := releases.NewManager().Execute(ctx, product, action)
 			if err != nil {
-				return core.Result{Status: core.StatusFailed, Message: title + " failed", Error: &core.ErrorInfo{Code: "RELEASE_OPERATION_FAILED", Message: err.Error()}, ExitCode: core.ExitVerificationFailed}
+				details := err.Error()
+				if output = strings.TrimSpace(output); output != "" {
+					if len(output) > 4096 {
+						output = output[len(output)-4096:]
+					}
+					details += ": " + output
+				}
+				return core.Result{Status: core.StatusFailed, Message: title + " failed", Error: &core.ErrorInfo{Code: "RELEASE_OPERATION_FAILED", Message: details}, ExitCode: core.ExitVerificationFailed}
 			}
 			return success(title+" completed", true, map[string]interface{}{"product": product, "version": manifest.Version, "installer_output": output})
 		},
@@ -198,11 +209,28 @@ func addSystem(r *core.Registry) {
 			data := adapters.HostSummary(ctx)
 			osInfo := adapters.DetectOS()
 			status := "HEALTHY"
-			if !osInfo.Supported {
-				status = "PARTIAL"
+			checks := make([]map[string]interface{}, 0, 6)
+			addCheck := func(name string, ok bool, message string) {
+				checkStatus := "ok"
+				if !ok {
+					checkStatus = "failed"
+					status = "PARTIAL"
+				}
+				checks = append(checks, map[string]interface{}{"name": name, "status": checkStatus, "message": message})
 			}
+			addCheck("os", osInfo.Supported, osInfo.PrettyName)
+			addCheck("service_manager", adapters.CommandExists("systemctl"), "systemctl must be available for service operations")
+			addCheck("package_manager", adapters.CommandExists("apt-get"), "apt-get must be available for package operations")
+			free, diskErr := diskFreeBytes(hostPath(ctx.Env, "/"))
+			addCheck("disk", diskErr == nil && free >= 512*1024*1024, "at least 512 MB must be available")
+			addresses, _ := data["ip_addresses"].(string)
+			addCheck("network", strings.TrimSpace(addresses) != "", "at least one IP address must be detected")
+			dnsContext, cancelDNS := context.WithTimeout(ctx, 3*time.Second)
+			dnsErr := resolveWithRetry(dnsContext, net.DefaultResolver.LookupHost, "acme-v02.api.letsencrypt.org", 1, 0)
+			cancelDNS()
+			addCheck("dns", dnsErr == nil, "resolve acme-v02.api.letsencrypt.org: "+errorText(dnsErr))
 			data["status"] = status
-			data["checks"] = []string{"os", "host", "kernel", "memory", "disk", "network"}
+			data["checks"] = checks
 			return success("Doctor finished with status "+status, false, data)
 		},
 	})
@@ -234,6 +262,13 @@ func addSystem(r *core.Registry) {
 		{ID: "cleanup", Name: "Delete managed resources"},
 		{ID: "lockdown", Name: "Enter final lockdown"},
 	}, exterminatusHost))
+}
+
+func errorText(err error) string {
+	if err == nil {
+		return "ok"
+	}
+	return err.Error()
 }
 
 func addFirewall(r *core.Registry) {
@@ -327,7 +362,7 @@ func addCerts(r *core.Registry) {
 		Usage: "sindri cert new [domain]", Title: "Issue a certificate with Certbot standalone",
 		Risk: core.RiskChange, ReadOnly: false,
 		Inputs:  []core.InputSpec{{Name: "domain", Position: 1, Type: core.InputString, Required: true, Prompt: "Enter a domain name:"}},
-		Steps:   []core.StepSpec{{ID: "precheck", Name: "Validate Certbot and domain"}, {ID: "issue", Name: "Issue certificate"}, {ID: "verify", Name: "Verify certificate files"}},
+		Steps:   certificateIssueSteps(),
 		Handler: certificateNew,
 	})
 	r.Add(core.Scenario{
@@ -348,29 +383,65 @@ var certificateName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$`)
 
 func certificateNew(ctx core.Context, req core.Request, inputs map[string]interface{}) core.Result {
 	domain := strings.TrimSpace(inputs["domain"].(string))
-	steps := []core.StepSpec{{ID: "precheck", Name: "Validate Certbot and domain"}, {ID: "issue", Name: "Issue certificate"}, {ID: "verify", Name: "Verify certificate files"}}
+	steps := certificateIssueSteps()
 	if !certificateName.MatchString(domain) || !strings.Contains(domain, ".") {
 		return core.Result{Status: core.StatusFailed, Error: &core.ErrorInfo{Code: "DOMAIN_INVALID", Message: "A valid DNS domain is required"}, Steps: failedSteps(steps, "precheck"), ExitCode: core.ExitInvalidCommand}
 	}
 	if req.Test {
 		return planned("Certificate would be issued", steps, inputs)
 	}
-	if !adapters.CommandExists("certbot") {
-		return core.Result{Status: core.StatusFailed, Error: &core.ErrorInfo{Code: "CERTBOT_NOT_FOUND", Message: "Install Certbot before issuing a certificate"}, Steps: failedSteps(steps, "precheck"), ExitCode: core.ExitPrecheckFailed}
+	if failure := requireUbuntuRoot(ctx, "CERTIFICATE_PRECHECK_FAILED"); failure != nil {
+		return *failure
 	}
-	run := adapters.Run(ctx, "certbot", "certonly", "--standalone", "--non-interactive", "--agree-tos", "--register-unsafely-without-email", "-d", domain)
+	if adapters.CommandExists("nginx") && runSystemctl(ctx, "is-active", "--quiet", "nginx").ExitCode == 0 {
+		return core.Result{Status: core.StatusFailed, Error: &core.ErrorInfo{Code: "NGINX_ACTIVE", Message: "Standalone certificate issuance requires port 80; run sindri nginx stop first"}, Steps: failedSteps(steps, "precheck"), ExitCode: core.ExitPrecheckFailed}
+	}
+	if code, err := acmeConnectivityCheck(ctx, domain); err != nil {
+		return core.Result{Status: core.StatusFailed, Error: &core.ErrorInfo{Code: code, Message: err.Error()}, Steps: failedSteps(steps, "connectivity"), ExitCode: core.ExitPrecheckFailed}
+	}
+	if !adapters.CommandExists("certbot") {
+		if run := runApt(ctx, "update"); run.ExitCode != 0 {
+			result := commandFailed("CERTBOT_INSTALL_FAILED", "install_certbot", run)
+			result.Steps = failedSteps(steps, "install_certbot")
+			return result
+		}
+		if run := runApt(ctx, "install", "-y", "certbot"); run.ExitCode != 0 {
+			result := commandFailed("CERTBOT_INSTALL_FAILED", "install_certbot", run)
+			result.Steps = failedSteps(steps, "install_certbot")
+			return result
+		}
+		if !adapters.CommandExists("certbot") {
+			return core.Result{Status: core.StatusFailed, Error: &core.ErrorInfo{Code: "CERTBOT_INSTALL_VERIFY_FAILED", Message: "Certbot is missing after package installation"}, Steps: failedSteps(steps, "install_certbot"), ExitCode: core.ExitVerificationFailed}
+		}
+		resources := loadManaged(ctx.Env)
+		resources.Packages = mergeUnique(resources.Packages, "certbot")
+		if err := saveManaged(ctx.Env, resources); err != nil {
+			return managedStateFailure(err)
+		}
+	}
+	run := runCertbot(ctx, "certonly", "--standalone", "--non-interactive", "--agree-tos", "--register-unsafely-without-email", "-d", domain)
 	if run.ExitCode != 0 {
 		return core.Result{Status: core.StatusFailed, Error: &core.ErrorInfo{Code: "CERTBOT_FAILED", Message: strings.TrimSpace(run.Stderr)}, Steps: failedSteps(steps, "issue"), ExitCode: core.ExitGeneralFailure}
 	}
 	for _, name := range []string{"fullchain.pem", "privkey.pem"} {
-		if _, err := os.Stat(filepath.Join("/etc/letsencrypt/live", domain, name)); err != nil {
+		if _, err := os.Stat(hostPath(ctx.Env, filepath.Join("/etc/letsencrypt/live", domain, name))); err != nil {
 			return core.Result{Status: core.StatusFailed, Error: &core.ErrorInfo{Code: "CERTIFICATE_VERIFY_FAILED", Message: err.Error()}, Steps: failedSteps(steps, "verify"), ExitCode: core.ExitVerificationFailed}
 		}
 	}
 	return success("Certificate issued", true, map[string]interface{}{"certificate": domain})
 }
 
-func certificateCopy(_ core.Context, req core.Request, inputs map[string]interface{}) core.Result {
+func certificateIssueSteps() []core.StepSpec {
+	return []core.StepSpec{
+		{ID: "precheck", Name: "Validate the domain and port availability"},
+		{ID: "connectivity", Name: "Verify DNS and Let's Encrypt connectivity"},
+		{ID: "install_certbot", Name: "Install Certbot when required"},
+		{ID: "issue", Name: "Issue certificate"},
+		{ID: "verify", Name: "Verify certificate files"},
+	}
+}
+
+func certificateCopy(ctx core.Context, req core.Request, inputs map[string]interface{}) core.Result {
 	name := strings.TrimSpace(inputs["certificate"].(string))
 	destination := filepath.Clean(inputs["destination"].(string))
 	steps := []core.StepSpec{{ID: "precheck", Name: "Validate certificate source"}, {ID: "copy", Name: "Copy certificate files"}, {ID: "verify", Name: "Verify copied files"}}
@@ -380,24 +451,35 @@ func certificateCopy(_ core.Context, req core.Request, inputs map[string]interfa
 	if req.Test {
 		return planned("Certificate files would be copied", steps, inputs)
 	}
-	source := filepath.Join("/etc/letsencrypt/live", name)
+	if failure := requireLinuxRoot("CERTIFICATE_COPY_PRECHECK_FAILED"); failure != nil {
+		return *failure
+	}
+	source := hostPath(ctx.Env, filepath.Join("/etc/letsencrypt/live", name))
+	targetDirectory := hostPath(ctx.Env, destination)
 	files := []string{"fullchain.pem", "privkey.pem", "cert.pem", "chain.pem"}
-	if err := os.MkdirAll(destination, 0750); err != nil {
+	if err := os.MkdirAll(targetDirectory, 0750); err != nil {
 		return core.Result{Status: core.StatusFailed, Error: &core.ErrorInfo{Code: "CERTIFICATE_COPY_FAILED", Message: err.Error()}, Steps: failedSteps(steps, "copy"), ExitCode: core.ExitGeneralFailure}
 	}
+	managedFiles := make([]string, 0, len(files))
 	for _, filename := range files {
 		body, err := os.ReadFile(filepath.Join(source, filename))
 		if err != nil {
 			return core.Result{Status: core.StatusFailed, Error: &core.ErrorInfo{Code: "CERTIFICATE_NOT_FOUND", Message: err.Error()}, Steps: failedSteps(steps, "precheck"), ExitCode: core.ExitPrecheckFailed}
 		}
-		target := filepath.Join(destination, filename)
+		target := filepath.Join(targetDirectory, filename)
 		mode := os.FileMode(0644)
 		if filename == "privkey.pem" {
 			mode = 0600
 		}
-		if err := os.WriteFile(target, body, mode); err != nil {
+		if err := atomicWrite(target, body, mode); err != nil {
 			return core.Result{Status: core.StatusFailed, Error: &core.ErrorInfo{Code: "CERTIFICATE_COPY_FAILED", Message: err.Error()}, Steps: failedSteps(steps, "copy"), ExitCode: core.ExitGeneralFailure}
 		}
+		managedFiles = append(managedFiles, target)
+	}
+	resources := loadManaged(ctx.Env)
+	resources.Files = mergeUnique(resources.Files, managedFiles...)
+	if err := saveManaged(ctx.Env, resources); err != nil {
+		return managedStateFailure(err)
 	}
 	return success("Certificate files copied", true, map[string]interface{}{"certificate": name, "destination": destination})
 }
@@ -441,6 +523,9 @@ func firewallOpen(ctx core.Context, req core.Request, inputs map[string]interfac
 	if req.Test {
 		return planned(fmt.Sprintf("Port %d/%s would be opened", port, protocol), steps, inputs)
 	}
+	if failure := requireLinuxRoot("FIREWALL_PRECHECK_FAILED"); failure != nil {
+		return *failure
+	}
 	if !adapters.CommandExists("ufw") {
 		return core.Result{
 			Status:   core.StatusFailed,
@@ -451,6 +536,13 @@ func firewallOpen(ctx core.Context, req core.Request, inputs map[string]interfac
 		}
 	}
 	rule := fmt.Sprintf("%d/%s", port, protocol)
+	before := adapters.Run(ctx, "ufw", "status")
+	if before.ExitCode != 0 {
+		return commandFailed("UFW_COMMAND_FAILED", "inspect_rule", before)
+	}
+	if ufwRulePresent(before.Stdout, rule) {
+		return success(fmt.Sprintf("Port %d/%s is already open", port, protocol), false, map[string]interface{}{"rule": rule})
+	}
 	add := adapters.Run(ctx, "ufw", "allow", rule)
 	if add.ExitCode != 0 {
 		return core.Result{
@@ -462,7 +554,7 @@ func firewallOpen(ctx core.Context, req core.Request, inputs map[string]interfac
 		}
 	}
 	verify := adapters.Run(ctx, "ufw", "status")
-	if verify.ExitCode != 0 || !strings.Contains(verify.Stdout, rule) {
+	if verify.ExitCode != 0 || !ufwRulePresent(verify.Stdout, rule) {
 		return core.Result{
 			Status:   core.StatusFailed,
 			Message:  "Firewall rule verification failed",
@@ -499,10 +591,14 @@ func plannedSteps(steps []core.StepSpec) []core.StepResult {
 
 func failedSteps(steps []core.StepSpec, failedID string) []core.StepResult {
 	out := make([]core.StepResult, 0, len(steps))
+	failureReached := false
 	for _, step := range steps {
 		status := "skipped"
 		if step.ID == failedID {
 			status = "failed"
+			failureReached = true
+		} else if !failureReached {
+			status = "completed"
 		}
 		out = append(out, core.StepResult{ID: step.ID, Name: step.Name, Status: status})
 	}

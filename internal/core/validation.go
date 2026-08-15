@@ -3,12 +3,22 @@ package core
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"strconv"
 )
 
 func ValidateInputs(s Scenario, raw map[string]interface{}) (map[string]interface{}, []FieldRequirement, error) {
 	if raw == nil {
 		raw = map[string]interface{}{}
+	}
+	allowed := make(map[string]bool, len(s.Inputs))
+	for _, spec := range s.Inputs {
+		allowed[spec.Name] = true
+	}
+	for name := range raw {
+		if !allowed[name] {
+			return nil, nil, fmt.Errorf("unknown input %q", name)
+		}
 	}
 	normalized := map[string]interface{}{}
 	var missing []FieldRequirement
@@ -94,6 +104,9 @@ func toInt(value interface{}) (int, error) {
 	case int64:
 		return int(v), nil
 	case float64:
+		if math.Trunc(v) != v {
+			return 0, fmt.Errorf("not an integer")
+		}
 		return int(v), nil
 	case json.Number:
 		return strconv.Atoi(string(v))

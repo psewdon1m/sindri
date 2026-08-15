@@ -61,5 +61,12 @@ Only registered `action` values are accepted. Arbitrary shell commands are not p
 
 ## Approval required
 
-Dangerous non-test actions return `approval_required` until the approval store is implemented.
+Dangerous non-test actions first return `approval_required` with a short-lived
+one-time approval ID and a plan hash. Re-submit the same action and inputs with
+both values to execute the approved plan. Approval IDs are persisted with a
+five-minute lifetime, are bound to the action and exact plan, and cannot be
+reused. A caller cannot manufacture an approval ID.
 
+Machine mode accepts exactly one JSON object, rejects unknown fields and input
+names, and does not coerce fractional numbers into integers. Human prompts and
+progress rendering are intentionally available only in regular CLI mode.

@@ -1,18 +1,18 @@
 {
   "schema_version": 1,
   "product": "sindri",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "repository": {
     "url": "https://github.com/psewdon1m/sindri",
-    "ref": "main",
+    "ref": "sindri-v1.2.0",
     "path": "."
   },
   "installer": {
-    "url": "https://raw.githubusercontent.com/psewdon1m/sindri/main/install.sh",
-    "sha256": "aa670b8339eea4b59fd96a2f1a89273a46d2cb3542d238eef4242bef60c9f5f9"
+    "url": "https://raw.githubusercontent.com/psewdon1m/sindri/sindri-v1.2.0/install.sh",
+    "sha256": "63066ffef9079b22a6c0b6a0455a2402f54a286796424c42d1f5964d169fdaf2"
   },
   "package": {
-    "url": "https://github.com/psewdon1m/sindri/releases/download/sindri-v1.1.0/sindri_1.1.0_amd64.deb",
+    "url": "https://github.com/psewdon1m/sindri/releases/download/sindri-v1.2.0/sindri_1.2.0_amd64.deb",
     "sha256": "replace-at-release-time"
   }
 }

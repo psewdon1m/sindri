@@ -14,5 +14,8 @@ The command must work from an immutable plan built from:
 - systemd units created by Sindri;
 - Sindri backups, recovery bundles, logs and history.
 
-The foundation build registers the scenario, risk level, approval boundary and test-mode plan. It does not execute cleanup yet.
-
+Before execution, Sindri shows the immutable plan and requires both the phrase
+`EXTERMINATUS` and the current hostname. The command removes only resources in
+the plan or resources explicitly recorded in managed inventory, reports
+already-absent items as skipped, continues after individual failures and
+returns a partial-success result when cleanup was incomplete.

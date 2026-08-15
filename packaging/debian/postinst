@@ -4,8 +4,9 @@ set -eu
 mkdir -p /etc/sindri
 mkdir -p /var/lib/sindri/backups
 mkdir -p /var/lib/sindri/recovery
+mkdir -p /var/lib/sindri/approvals
 mkdir -p /var/log/sindri/runs
 chmod 0750 /etc/sindri /var/lib/sindri /var/lib/sindri/backups /var/lib/sindri/recovery /var/log/sindri /var/log/sindri/runs
+chmod 0700 /var/lib/sindri/approvals
 
 exit 0
-

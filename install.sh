@@ -60,7 +60,9 @@ install_sindri() {
   trap 'rm -rf "$temporary"' EXIT INT TERM
   package=$(download_package "$temporary")
   DEBIAN_FRONTEND=noninteractive apt-get install -y "$package"
-  /usr/bin/sindri init
+  if [ "${SINDRI_MANAGED_INSTALL:-0}" != "1" ]; then
+    /usr/bin/sindri init
+  fi
   /usr/bin/sindri version
 }
 

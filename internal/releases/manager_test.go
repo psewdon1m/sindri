@@ -11,7 +11,7 @@ import (
 )
 
 func TestManagerDownloadsAndVerifiesInstaller(t *testing.T) {
-	installer := []byte("#!/usr/bin/env bash\nprintf 'managed:%s' \"$1\"\n")
+	installer := []byte("#!/usr/bin/env bash\nprintf 'managed:%s:%s' \"$1\" \"${SINDRI_MANAGED_INSTALL:-}\"\n")
 	sum := sha256.Sum256(installer)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/install.sh" {
@@ -27,7 +27,7 @@ func TestManagerDownloadsAndVerifiesInstaller(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if manifest.Version != "1.2.3" || output != "managed:update" {
+	if manifest.Version != "1.2.3" || output != "managed:update:1" {
 		t.Fatalf("unexpected result: %#v %q", manifest, output)
 	}
 }

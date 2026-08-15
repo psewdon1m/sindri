@@ -1,6 +1,9 @@
 package core
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+)
 
 type Registry struct {
 	byAction map[string]Scenario
@@ -84,4 +87,17 @@ func PositionalInputs(s Scenario, positional []string) map[string]interface{} {
 		inputs[spec.Name] = positional[spec.Position-1]
 	}
 	return inputs
+}
+
+func ValidatePositionalCount(s Scenario, positional []string) error {
+	maximum := 0
+	for _, spec := range s.Inputs {
+		if spec.Position > maximum {
+			maximum = spec.Position
+		}
+	}
+	if len(positional) > maximum {
+		return fmt.Errorf("too many arguments: expected at most %d, got %d", maximum, len(positional))
+	}
+	return nil
 }

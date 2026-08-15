@@ -1,5 +1,5 @@
 APP := sindri
-VERSION ?= 1.1.0
+VERSION ?= 1.2.0
 BUILD_ID ?= local
 GO ?= go
 DIST := dist
@@ -31,6 +31,7 @@ deb: build
 	mkdir -p $(DIST)/debroot/etc/sindri
 	mkdir -p $(DIST)/debroot/var/lib/sindri/backups
 	mkdir -p $(DIST)/debroot/var/lib/sindri/recovery
+	mkdir -p $(DIST)/debroot/var/lib/sindri/approvals
 	mkdir -p $(DIST)/debroot/var/log/sindri/runs
 	mkdir -p $(DIST)/debroot/usr/lib/sindri
 	mkdir -p $(DIST)/debroot/usr/share/doc/sindri/examples

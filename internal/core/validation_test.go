@@ -36,3 +36,19 @@ func TestValidateInputsConvertsInteger(t *testing.T) {
 		t.Fatalf("expected integer port, got %#v", inputs["port"])
 	}
 }
+
+func TestValidateInputsRejectsUnknownFields(t *testing.T) {
+	scenario := Scenario{ID: "firewall.open", Inputs: []InputSpec{{Name: "protocol", Type: InputChoice, Values: []string{"tcp", "udp"}, Default: "tcp"}}}
+	_, _, err := ValidateInputs(scenario, map[string]interface{}{"protcol": "udp"})
+	if err == nil {
+		t.Fatal("expected unknown input to be rejected")
+	}
+}
+
+func TestValidateInputsRejectsFractionalInteger(t *testing.T) {
+	scenario := Scenario{ID: "firewall.open", Inputs: []InputSpec{{Name: "port", Type: InputInteger, Minimum: 1, Maximum: 65535, Required: true}}}
+	_, _, err := ValidateInputs(scenario, map[string]interface{}{"port": 80.9})
+	if err == nil {
+		t.Fatal("expected fractional integer to be rejected")
+	}
+}

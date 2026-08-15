@@ -17,3 +17,10 @@ func TestMatchCLIChoosesLongestPath(t *testing.T) {
 		t.Fatalf("unexpected rest: %#v", rest)
 	}
 }
+
+func TestValidatePositionalCountRejectsExtraArguments(t *testing.T) {
+	scenario := Scenario{ID: "meta.version"}
+	if err := ValidatePositionalCount(scenario, []string{"unexpected"}); err == nil {
+		t.Fatal("expected extra argument to be rejected")
+	}
+}

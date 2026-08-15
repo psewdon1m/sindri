@@ -17,14 +17,49 @@ type CommandResult struct {
 	Stdout   string   `json:"stdout"`
 	Stderr   string   `json:"stderr"`
 	ExitCode int      `json:"exit_code"`
+	TimedOut bool     `json:"timed_out,omitempty"`
 }
 
 func Run(ctx context.Context, name string, args ...string) CommandResult {
-	return RunWithInput(ctx, "", name, args...)
+	return run(ctx, "", nil, 0, name, args...)
 }
 
 func RunWithInput(ctx context.Context, input string, name string, args ...string) CommandResult {
+	return run(ctx, input, nil, 0, name, args...)
+}
+
+func RunWithTimeout(ctx context.Context, timeout time.Duration, name string, args ...string) CommandResult {
+	return run(ctx, "", nil, timeout, name, args...)
+}
+
+func RunWithEnvTimeout(ctx context.Context, env map[string]string, timeout time.Duration, name string, args ...string) CommandResult {
+	return run(ctx, "", env, timeout, name, args...)
+}
+
+func RunWithInputTimeout(ctx context.Context, input string, timeout time.Duration, name string, args ...string) CommandResult {
+	return run(ctx, input, nil, timeout, name, args...)
+}
+
+func run(parent context.Context, input string, extraEnv map[string]string, timeout time.Duration, name string, args ...string) CommandResult {
+	ctx := parent
+	cancel := func() {}
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(parent, timeout)
+	}
+	defer cancel()
 	cmd := exec.CommandContext(ctx, name, args...)
+	if len(extraEnv) > 0 {
+		cmd.Env = make([]string, 0, len(os.Environ())+len(extraEnv))
+		for _, item := range os.Environ() {
+			key, _, _ := strings.Cut(item, "=")
+			if _, replaced := extraEnv[key]; !replaced {
+				cmd.Env = append(cmd.Env, item)
+			}
+		}
+		for key, value := range extraEnv {
+			cmd.Env = append(cmd.Env, key+"="+value)
+		}
+	}
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -34,6 +69,7 @@ func RunWithInput(ctx context.Context, input string, name string, args ...string
 	}
 	err := cmd.Run()
 	code := 0
+	timedOut := errors.Is(ctx.Err(), context.DeadlineExceeded)
 	if err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
@@ -43,11 +79,19 @@ func RunWithInput(ctx context.Context, input string, name string, args ...string
 			stderr.WriteString(err.Error())
 		}
 	}
+	if timedOut {
+		code = -1
+		if stderr.Len() > 0 {
+			stderr.WriteString(": ")
+		}
+		stderr.WriteString("command timed out")
+	}
 	return CommandResult{
 		Command:  append([]string{name}, args...),
 		Stdout:   strings.TrimSpace(stdout.String()),
 		Stderr:   strings.TrimSpace(stderr.String()),
 		ExitCode: code,
+		TimedOut: timedOut,
 	}
 }
 

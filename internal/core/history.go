@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 const maxHistoryEntries = 100
@@ -13,24 +14,42 @@ func AppendHistory(env Environment, entry HistoryEntry) error {
 	if err := EnsureRuntimeDirs(env); err != nil {
 		return err
 	}
+	unlock, err := acquireFileLock(filepath.Join(env.DataDir, "history.lock"), 5*time.Second, 30*time.Second)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	path := filepath.Join(env.DataDir, "history.jsonl")
 	entries, _ := ReadHistory(env, maxHistoryEntries-1)
 	entries = append([]HistoryEntry{entry}, entries...)
 	if len(entries) > maxHistoryEntries {
 		entries = entries[:maxHistoryEntries]
 	}
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0640)
+	file, err := os.CreateTemp(env.DataDir, ".history-*.tmp")
 	if err != nil {
 		return err
 	}
-	defer file.Close()
+	tempPath := file.Name()
+	defer os.Remove(tempPath)
+	if err := file.Chmod(0640); err != nil {
+		_ = file.Close()
+		return err
+	}
 	enc := json.NewEncoder(file)
 	for _, item := range entries {
 		if err := enc.Encode(item); err != nil {
+			_ = file.Close()
 			return err
 		}
 	}
-	return nil
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tempPath, path)
 }
 
 func ReadHistory(env Environment, limit int) ([]HistoryEntry, error) {
