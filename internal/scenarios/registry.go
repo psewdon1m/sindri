@@ -22,6 +22,7 @@ func NewRegistry(version string, protocolVersion string, buildID string) *core.R
 	addSystem(r)
 	addFirewall(r)
 	addDocker(r)
+	addGeo(r)
 	addNginx(r)
 	addUsers(r)
 	addCerts(r)
@@ -44,6 +45,11 @@ func addNginx(r *core.Registry) {
 		Risk: core.RiskRead, ReadOnly: true,
 		Handler: nginxStatus,
 	})
+	configScenario := hostScenario("nginx.config_edit", []string{"nginx", "conf"}, "sindri nginx conf [config]", "Edit an Nginx site configuration", core.RiskChange, nginxConfigEditSteps, nginxConfigEdit,
+		core.InputSpec{Name: "config", Position: 1, Type: core.InputString})
+	configScenario.Description = "Lists regular files in /etc/nginx/sites-available, lets the operator choose one when needed and opens it in nano."
+	configScenario.Interactive = true
+	r.Add(configScenario)
 	r.Add(hostScenario("nginx.start", []string{"nginx", "start"}, "sindri nginx start", "Validate and start the shared host Nginx", core.RiskChange, []core.StepSpec{
 		{ID: "config_test", Name: "Validate the complete Nginx configuration"},
 		{ID: "service", Name: "Enable and start Nginx"},
@@ -109,7 +115,7 @@ func addMeta(r *core.Registry, version string, protocolVersion string, buildID s
 					continue
 				}
 				group, _, _ := strings.Cut(scenario.ID, ".")
-				commands = append(commands, map[string]interface{}{
+				command := map[string]interface{}{
 					"action":      scenario.ID,
 					"title":       scenario.Title,
 					"description": scenario.Description,
@@ -117,7 +123,11 @@ func addMeta(r *core.Registry, version string, protocolVersion string, buildID s
 					"risk":        scenario.Risk,
 					"inputs":      scenario.Inputs,
 					"available":   true,
-				})
+				}
+				if len(scenario.CLIAliases) > 0 {
+					command["cli_aliases"] = scenario.CLIAliases
+				}
+				commands = append(commands, command)
 			}
 			return success("Help metadata collected", false, map[string]interface{}{
 				"commands":         commands,
@@ -234,13 +244,20 @@ func addSystem(r *core.Registry) {
 			return success("Doctor finished with status "+status, false, data)
 		},
 	})
-	r.Add(hostScenario("system.make_ready", []string{"make_it_ready"}, "sindri make_it_ready", "Prepare base Ubuntu server packages", core.RiskChange, []core.StepSpec{
+	makeReadyScenario := hostScenario("system.make_ready", []string{"make_it_ready"}, "sindri make_it_ready", "Prepare base Ubuntu server packages", core.RiskChange, []core.StepSpec{
 		{ID: "check_os", Name: "Check supported Ubuntu release"},
 		{ID: "apt_update", Name: "Update package index"},
 		{ID: "apt_upgrade", Name: "Upgrade packages"},
-		{ID: "install_tools", Name: "Install git, curl and gnupg"},
+		{ID: "install_tools", Name: "Install git, curl, gnupg and nano"},
+		{ID: "install_fail2ban", Name: "Install Fail2ban"},
 		{ID: "journal_limits", Name: "Configure system journal limits"},
-	}, makeReady))
+		{ID: "configure_fail2ban", Name: "Configure the SSH jail"},
+		{ID: "validate_fail2ban", Name: "Validate the Fail2ban configuration"},
+		{ID: "start_fail2ban", Name: "Enable and start Fail2ban"},
+		{ID: "verify_fail2ban", Name: "Verify the SSH jail"},
+	}, makeReady)
+	makeReadyScenario.CLIAliases = [][]string{{"mir"}}
+	r.Add(makeReadyScenario)
 	r.Add(hostScenario("system.reboot", []string{"reboot"}, "sindri reboot", "Reboot the server", core.RiskDangerous, []core.StepSpec{
 		{ID: "sync", Name: "Flush filesystem buffers"},
 		{ID: "reboot", Name: "Request system reboot"},
@@ -274,7 +291,7 @@ func errorText(err error) string {
 func addFirewall(r *core.Registry) {
 	portInput := core.InputSpec{Name: "port", Position: 1, Type: core.InputInteger, Minimum: 1, Maximum: 65535, Required: true, Prompt: "Which port should be opened?"}
 	protocolInput := core.InputSpec{Name: "protocol", Position: 2, Type: core.InputChoice, Values: []string{"tcp", "udp"}, Default: "tcp"}
-	r.Add(core.Scenario{
+	addWithCLIGroupAlias(r, core.Scenario{
 		ID:         "firewall.status",
 		APIVersion: 1,
 		CLIPath:    []string{"firewall", "status"},
@@ -289,18 +306,18 @@ func addFirewall(r *core.Registry) {
 			run := adapters.Run(ctx, "ufw", "status", "verbose")
 			return success("Firewall status collected", false, map[string]interface{}{"installed": true, "ufw": run.Stdout, "stderr": run.Stderr})
 		},
-	})
-	r.Add(hostScenario("firewall.enable", []string{"firewall", "on"}, "sindri firewall on", "Enable UFW while preserving SSH access", core.RiskChange, []core.StepSpec{
+	}, "firewall", "fw")
+	addWithCLIGroupAlias(r, hostScenario("firewall.enable", []string{"firewall", "on"}, "sindri firewall on", "Enable UFW while preserving SSH access", core.RiskChange, []core.StepSpec{
 		{ID: "check_ufw", Name: "Check UFW installation"},
 		{ID: "allow_ssh", Name: "Allow SSH ports"},
 		{ID: "enable", Name: "Enable UFW"},
 		{ID: "verify", Name: "Verify firewall status"},
-	}, firewallEnable))
-	r.Add(hostScenario("firewall.disable", []string{"firewall", "off"}, "sindri firewall off", "Disable UFW", core.RiskDangerous, []core.StepSpec{
+	}, firewallEnable), "firewall", "fw")
+	addWithCLIGroupAlias(r, hostScenario("firewall.disable", []string{"firewall", "off"}, "sindri firewall off", "Disable UFW", core.RiskDangerous, []core.StepSpec{
 		{ID: "disable", Name: "Disable UFW"},
 		{ID: "verify", Name: "Verify firewall status"},
-	}, firewallDisable))
-	r.Add(core.Scenario{
+	}, firewallDisable), "firewall", "fw")
+	addWithCLIGroupAlias(r, core.Scenario{
 		ID:          "firewall.open",
 		APIVersion:  1,
 		CLIPath:     []string{"firewall", "open"},
@@ -315,12 +332,12 @@ func addFirewall(r *core.Registry) {
 			{ID: "verify_rule", Name: "Verify firewall rule"},
 		},
 		Handler: firewallOpen,
-	})
-	r.Add(hostScenario("firewall.close", []string{"firewall", "close"}, "sindri firewall close [port] [protocol]", "Close firewall port", core.RiskDangerous, []core.StepSpec{
+	}, "firewall", "fw")
+	addWithCLIGroupAlias(r, hostScenario("firewall.close", []string{"firewall", "close"}, "sindri firewall close [port] [protocol]", "Close firewall port", core.RiskDangerous, []core.StepSpec{
 		{ID: "inspect_rule", Name: "Check existing rule"},
 		{ID: "delete_rule", Name: "Delete firewall rule"},
 		{ID: "verify_rule", Name: "Verify firewall rule"},
-	}, firewallClose, portInput, protocolInput))
+	}, firewallClose, portInput, protocolInput), "firewall", "fw")
 }
 
 func addDocker(r *core.Registry) {
@@ -346,6 +363,13 @@ func addDocker(r *core.Registry) {
 	r.Add(hostScenario("docker.clean", []string{"docker", "clean"}, "sindri docker clean", "Remove Docker containers, images, volumes and build cache", core.RiskDangerous, nil, dockerClean))
 	r.Add(hostScenario("docker.up", []string{"docker", "up"}, "sindri docker up [path]", "Start Docker Compose project or stopped containers", core.RiskChange, nil, dockerUp, core.InputSpec{Name: "path", Position: 1, Type: core.InputPath, Default: "."}))
 	r.Add(hostScenario("docker.down", []string{"docker", "down"}, "sindri docker down [path]", "Stop Docker Compose project or running containers", core.RiskDangerous, nil, dockerDown, core.InputSpec{Name: "path", Position: 1, Type: core.InputPath, Default: "."}))
+}
+
+func addGeo(r *core.Registry) {
+	containerInput := core.InputSpec{Name: "container", Position: 1, Type: core.InputString, Required: true, Prompt: "Enter the Docker container name:"}
+	scenario := hostScenario("geo.get", []string{"geo", "get"}, "sindri geo get [container]", "Update Xray geodata in a Docker container", core.RiskChange, geoDataSteps, geoGet, containerInput)
+	scenario.Description = "Downloads the current runetfreedom geosite.dat and geoip.dat release, verifies SHA-256, backs up the installed files and safely restarts the selected container."
+	r.Add(scenario)
 }
 
 func addUsers(r *core.Registry) {
@@ -514,6 +538,14 @@ func hostScenario(id string, cli []string, usage string, title string, risk core
 			return handler(ctx, req, values)
 		},
 	}
+}
+
+func addWithCLIGroupAlias(r *core.Registry, scenario core.Scenario, group string, alias string) {
+	if len(scenario.CLIPath) > 0 && strings.EqualFold(scenario.CLIPath[0], group) {
+		aliasPath := append([]string{alias}, scenario.CLIPath[1:]...)
+		scenario.CLIAliases = append(scenario.CLIAliases, aliasPath)
+	}
+	r.Add(scenario)
 }
 
 func firewallOpen(ctx core.Context, req core.Request, inputs map[string]interface{}) core.Result {

@@ -11,6 +11,34 @@ import (
 	"sindri/internal/core"
 )
 
+func TestFail2banSSHDJailUsesConfiguredPorts(t *testing.T) {
+	want := `[sshd]
+enabled = true
+backend = systemd
+port = 22,2222
+findtime = 10m
+maxretry = 5
+bantime = 1h
+`
+	if got := string(fail2banSSHDJail([]int{22, 2222})); got != want {
+		t.Fatalf("unexpected Fail2ban SSH jail:\n%s", got)
+	}
+}
+
+func TestSSHPortsUsesDefaultOnlyWithoutExplicitConfiguration(t *testing.T) {
+	env := testEnvironment(t)
+	if ports := sshPorts(env); len(ports) != 1 || ports[0] != 22 {
+		t.Fatalf("default SSH ports = %#v, want [22]", ports)
+	}
+
+	writeFile(t, hostPath(env, "/etc/ssh/sshd_config"), "Port 2222\n")
+	writeFile(t, hostPath(env, "/etc/ssh/sshd_config.d/10-secondary.conf"), "Port 2200\nPort 2222\n")
+	ports := sshPorts(env)
+	if len(ports) != 2 || ports[0] != 2200 || ports[1] != 2222 {
+		t.Fatalf("configured SSH ports = %#v, want [2200 2222]", ports)
+	}
+}
+
 func TestProductionScenariosExposeValidatedTestPlans(t *testing.T) {
 	env := testEnvironment(t)
 	registry := NewRegistry("test", "1", "test")
@@ -32,7 +60,9 @@ func TestProductionScenariosExposeValidatedTestPlans(t *testing.T) {
 		{"docker.down", map[string]interface{}{"path": "."}},
 		{"docker.clean", nil},
 		{"docker.logs", map[string]interface{}{"lines": 100}},
+		{"geo.get", map[string]interface{}{"container": "node"}},
 		{"nginx.install", nil},
+		{"nginx.config_edit", nil},
 		{"nginx.start", nil},
 		{"nginx.reload", nil},
 		{"nginx.stop", nil},
@@ -82,13 +112,69 @@ func TestProductionHandlersAgainstIsolatedSystemAdapters(t *testing.T) {
 	if err := os.MkdirAll(os.Getenv("FAKE_STATE_DIR"), 0750); err != nil {
 		t.Fatal(err)
 	}
+	containerDirectory := filepath.Join(os.Getenv("FAKE_STATE_DIR"), "container-node", "usr", "local", "share", "xray")
+	writeFile(t, filepath.Join(containerDirectory, "geosite.dat"), "old geosite\n")
+	writeFile(t, filepath.Join(containerDirectory, "geoip.dat"), "old geoip\n")
+	writeFile(t, filepath.Join(os.Getenv("FAKE_STATE_DIR"), "container-node-running"), "running\n")
+	releaseVersion := "new"
+	originalGeoDataLoader := geoDataAssetLoader
+	geoDataAssetLoader = func(ctx context.Context, directory string) ([]geoDataAsset, error) {
+		assets := make([]geoDataAsset, 0, len(geoDataNames))
+		for _, name := range geoDataNames {
+			path := filepath.Join(directory, name)
+			writeFile(t, path, releaseVersion+" "+name+"\n")
+			hash, size, err := hashGeoDataFile(path)
+			if err != nil {
+				return nil, err
+			}
+			assets = append(assets, geoDataAsset{Name: name, Path: path, SHA256: hash, Size: size})
+		}
+		return assets, nil
+	}
+	t.Cleanup(func() { geoDataAssetLoader = originalGeoDataLoader })
 	writeFile(t, hostPath(env, "/etc/os-release"), "ID=ubuntu\nVERSION_ID=\"24.04\"\nVERSION_CODENAME=noble\n")
 	if err := os.MkdirAll(hostPath(env, "/var"), 0755); err != nil {
 		t.Fatal(err)
 	}
+	writeFile(t, hostPath(env, "/etc/ssh/sshd_config"), "Port 2222\n")
 	ctx := core.Context{Context: context.Background(), Env: env}
 
 	assertResult(t, "make ready", makeReady(ctx, core.Request{}, nil), core.StatusSuccess)
+	aptCalls, err := os.ReadFile(filepath.Join(os.Getenv("FAKE_STATE_DIR"), "apt-get-calls"))
+	if err != nil || !strings.Contains(string(aptCalls), "install -y fail2ban") {
+		t.Fatalf("Fail2ban package installation was not requested: %q, %v", aptCalls, err)
+	}
+	fail2banConfig, err := os.ReadFile(hostPath(env, fail2banJailPath))
+	if err != nil {
+		t.Fatalf("Fail2ban SSH jail was not written: %v", err)
+	}
+	for _, expected := range []string{
+		"[sshd]", "enabled = true", "backend = systemd", "port = 2222",
+		"findtime = 10m", "maxretry = 5", "bantime = 1h",
+	} {
+		if !strings.Contains(string(fail2banConfig), expected) {
+			t.Fatalf("Fail2ban SSH jail is missing %q: %s", expected, fail2banConfig)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(os.Getenv("FAKE_STATE_DIR"), "service-fail2ban-active")); err != nil {
+		t.Fatalf("Fail2ban service was not activated: %v", err)
+	}
+	fail2banCalls, err := os.ReadFile(filepath.Join(os.Getenv("FAKE_STATE_DIR"), "fail2ban-client-calls"))
+	if err != nil {
+		t.Fatalf("Fail2ban client calls were not recorded: %v", err)
+	}
+	for _, expected := range []string{"-t", "status sshd", "--version"} {
+		if !strings.Contains(string(fail2banCalls), expected) {
+			t.Fatalf("Fail2ban client was not called with %q: %s", expected, fail2banCalls)
+		}
+	}
+	managed := loadManaged(env)
+	if !containsString(managed.Packages, "fail2ban") ||
+		!containsString(managed.Packages, "nano") ||
+		!containsString(managed.Services, "fail2ban.service") ||
+		!containsString(managed.Files, hostPath(env, fail2banJailPath)) {
+		t.Fatalf("Fail2ban resources were not tracked: %#v", managed)
+	}
 	assertResult(t, "reboot", rebootHost(ctx, core.Request{}, nil), core.StatusSuccess)
 	assertResult(t, "firewall enable", firewallEnable(ctx, core.Request{}, nil), core.StatusSuccess)
 	assertResult(t, "firewall disable", firewallDisable(ctx, core.Request{}, nil), core.StatusSuccess)
@@ -96,6 +182,41 @@ func TestProductionHandlersAgainstIsolatedSystemAdapters(t *testing.T) {
 	assertResult(t, "docker install", dockerInstall(ctx, core.Request{}, nil), core.StatusSuccess)
 	assertResult(t, "docker logs", dockerLogs(ctx, core.Request{}, map[string]interface{}{"lines": 50}), core.StatusSuccess)
 	assertResult(t, "docker clean", dockerClean(ctx, core.Request{}, nil), core.StatusSuccess)
+	geoInputs := map[string]interface{}{"container": "node"}
+	geoUpdated := geoGet(ctx, core.Request{}, geoInputs)
+	assertResult(t, "geodata update", geoUpdated, core.StatusSuccess)
+	if !geoUpdated.Changed || geoUpdated.Data["backup"] == "" {
+		t.Fatalf("geodata update did not report its change and backup: %#v", geoUpdated)
+	}
+	for _, name := range geoDataNames {
+		body, err := os.ReadFile(filepath.Join(containerDirectory, name))
+		if err != nil || string(body) != releaseVersion+" "+name+"\n" {
+			t.Fatalf("container %s was not updated: %q, %v", name, body, err)
+		}
+		backup, _ := geoUpdated.Data["backup"].(string)
+		oldBody, err := os.ReadFile(filepath.Join(backup, name))
+		if err != nil || string(oldBody) != "old "+strings.TrimSuffix(name, ".dat")+"\n" {
+			t.Fatalf("backup %s is invalid: %q, %v", name, oldBody, err)
+		}
+	}
+	geoUnchanged := geoGet(ctx, core.Request{}, geoInputs)
+	assertResult(t, "unchanged geodata", geoUnchanged, core.StatusSuccess)
+	if geoUnchanged.Changed || geoUnchanged.Data["restarted"] != false {
+		t.Fatalf("unchanged geodata restarted the container: %#v", geoUnchanged)
+	}
+	releaseVersion = "broken"
+	writeFile(t, filepath.Join(os.Getenv("FAKE_STATE_DIR"), "fail-next-geodata-install"), "fail\n")
+	geoRolledBack := geoGet(ctx, core.Request{}, geoInputs)
+	assertResult(t, "geodata rollback", geoRolledBack, core.StatusFailed)
+	if geoRolledBack.Data["rolled_back"] != true {
+		t.Fatalf("failed geodata update was not rolled back: %#v", geoRolledBack)
+	}
+	for _, name := range geoDataNames {
+		body, err := os.ReadFile(filepath.Join(containerDirectory, name))
+		if err != nil || string(body) != "new "+name+"\n" {
+			t.Fatalf("rollback did not restore %s: %q, %v", name, body, err)
+		}
+	}
 	assertResult(t, "nginx install", nginxInstall(ctx, core.Request{}, nil), core.StatusSuccess)
 	cloudflareConfig, err := os.ReadFile(hostPath(env, nginxCloudflareIP))
 	if err != nil || !strings.Contains(string(cloudflareConfig), "real_ip_header CF-Connecting-IP;") {
@@ -322,7 +443,11 @@ name=${0##*/}
 state=${FAKE_STATE_DIR:?}
 mkdir -p "$state"
 case "$name" in
-  apt-get|sync|sysctl)
+  apt-get)
+    printf '%s\n' "$*" >>"$state/apt-get-calls"
+    exit 0
+    ;;
+  sync|sysctl)
     exit 0
     ;;
   systemctl)
@@ -333,7 +458,7 @@ case "$name" in
         if [ -f "$state/service-$service-active" ]; then exit 0; fi
         exit 1
         ;;
-      start) : >"$state/service-$service-active" ;;
+      start|restart) : >"$state/service-$service-active" ;;
       stop) rm -f "$state/service-$service-active" ;;
       reload)
         if [ -f "$state/service-$service-active" ]; then exit 0; fi
@@ -350,6 +475,9 @@ case "$name" in
   git|gpg)
     printf '%s version test\n' "$name"
     ;;
+	 nano)
+	if [ "$1" = "--version" ]; then printf 'GNU nano test\n'; fi
+	;;
   curl)
     output=""
     previous=""
@@ -378,6 +506,48 @@ case "$name" in
     esac
     ;;
   docker)
+	if [ "$1" = "cp" ]; then
+	  source=$2
+	  destination=$3
+	  case "$source" in
+		node:*)
+		  local_source="$state/container-node${source#node:}"
+		  mkdir -p "$(dirname "$destination")"
+		  /bin/cp "$local_source" "$destination"
+		  ;;
+		*)
+		  case "$destination" in
+			node:*)
+			  if [ -f "$state/fail-next-geodata-install" ]; then
+				case "$source" in
+				  */release/*) rm -f "$state/fail-next-geodata-install"; printf 'simulated copy failure\n' >&2; exit 1 ;;
+				esac
+			  fi
+			  local_destination="$state/container-node${destination#node:}"
+			  mkdir -p "$(dirname "$local_destination")"
+			  /bin/cp "$source" "$local_destination"
+			  ;;
+			*) exit 1 ;;
+		  esac
+		  ;;
+	  esac
+	  exit $?
+	fi
+	if [ "$1" = "stop" ] && [ "$4" = "node" ]; then
+	  rm -f "$state/container-node-running"
+	  printf 'node\n'
+	  exit 0
+	fi
+	if [ "$1" = "start" ] && [ "$2" = "node" ]; then
+	  : >"$state/container-node-running"
+	  printf 'node\n'
+	  exit 0
+	fi
+	if [ "$1" = "exec" ] && [ "$2" = "node" ] && [ "$3" = "test" ] && [ "$4" = "-s" ]; then
+	  [ -f "$state/container-node-running" ] || exit 1
+	  [ -s "$state/container-node$5" ]
+	  exit $?
+	fi
     case "$*" in
       "--version") printf 'Docker version test\n' ;;
       "compose version") printf 'Docker Compose version test\n' ;;
@@ -387,6 +557,9 @@ case "$name" in
       "images -aq") printf 'image-a\n' ;;
       "volume ls -q") printf 'volume-a\n' ;;
       "network ls --filter type=custom -q") printf 'network-a\n' ;;
+	  "inspect --type container --format {{.State.Running}} node")
+		if [ -f "$state/container-node-running" ]; then printf 'true\n'; else printf 'false\n'; fi
+		;;
       "inspect --format {{.Name}}"*) printf '/container-a\n' ;;
       "logs --timestamps --tail"*) printf '2026-07-27T12:00:00Z fake log\n' ;;
     esac
@@ -420,6 +593,14 @@ case "$name" in
 	printf '%s\n' "${RES_OPTIONS:-}" >"$state/certbot-res-options"
     exit 0
     ;;
+  fail2ban-client)
+    printf '%s\n' "$*" >>"$state/fail2ban-client-calls"
+    case "$*" in
+      "--version") printf 'Fail2Ban vtest\n' ;;
+      "status sshd") printf 'Status for the jail: sshd\n' ;;
+      "-t") printf 'OK: configuration test is successful\n' ;;
+    esac
+    ;;
   nginx)
     case "$1" in
       -v) printf 'nginx version: nginx/test\n' >&2 ;;
@@ -431,9 +612,9 @@ esac
 exit 0
 `
 	for _, name := range []string{
-		"apt-get", "sync", "sysctl", "systemctl", "git", "gpg", "curl", "ufw",
+		"apt-get", "sync", "sysctl", "systemctl", "git", "gpg", "nano", "curl", "ufw",
 		"docker", "containerd", "id", "useradd", "userdel", "usermod", "groups",
-		"chpasswd", "certbot", "nginx",
+		"chpasswd", "certbot", "fail2ban-client", "nginx",
 	} {
 		writeExecutable(t, filepath.Join(directory, name), script)
 	}

@@ -12,6 +12,7 @@ Run host-changing commands with `sudo`:
 ```bash
 sudo sindri nginx install
 sudo sindri nginx status
+sudo sindri nginx conf
 sudo sindri nginx start
 sudo sindri nginx reload
 sudo sindri nginx stop
@@ -50,7 +51,11 @@ Sindri manages the standard Ubuntu site paths:
 /etc/nginx/sites-enabled/default -> /etc/nginx/sites-available/default
 ```
 
-Edit `sites-available/default` for the host and run `sindri nginx reload`.
+Run `sindri nginx conf` to select and edit a regular file from
+`sites-available`; when only one configuration exists it opens immediately.
+You can also use `sindri nginx conf default` to select it directly. Sindri
+opens the selected configuration in `nano` and reports whether the file was
+changed. Then run `sindri nginx reload`.
 `start` and `reload` execute `nginx -t` first and leave the service unchanged
 when the complete configuration is invalid.
 

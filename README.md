@@ -17,10 +17,13 @@ Implemented in this repository:
   redacted run logs and concurrency-safe history.
 - Read commands: `version`, `help`, `info`, `doctor`, `history`,
   `firewall status`, `docker info` and bounded `docker logs`.
-- Production system operations: base Ubuntu preparation, reboot, reversible
-  network lockdown/recovery and managed-scope exterminatus.
+- Production system operations: base Ubuntu preparation with a managed
+  Fail2ban SSH jail, reboot, reversible network lockdown/recovery and
+  managed-scope exterminatus.
 - Production firewall operations: enable, disable, open and close.
 - Production Docker operations: install, uninstall, up, down, clean and logs.
+- Verified Xray geodata updates for the `node` container, with backup, restart
+  and automatic rollback.
 - Shared host Nginx operations: install, status, validated start, zero-downtime
   configuration reload and stop, including trusted Cloudflare proxy ranges and
   restoration of the original visitor IP.
@@ -36,8 +39,10 @@ Implemented in this repository:
 Release creation and publication are documented in
 [RELEASING.md](RELEASING.md).
 
-Sindri manages only itself. Agent Node lifecycle commands are deliberately not
-part of its registry, and Sindri never reads Kernel.
+Agent Node installation and lifecycle commands are deliberately not part of
+Sindri's registry, and Sindri never reads Kernel. The narrowly scoped
+`geo get` maintenance command only updates Xray geodata in an existing,
+operator-selected container.
 
 ## Production installation
 
@@ -66,9 +71,15 @@ The local development machine must have Go installed. The target runtime does no
 ```bash
 sindri version
 sindri doctor
+sindri mir --test
 sindri firewall status
+sindri fw status
 sindri firewall open 80 tcp --test
+sindri geo get
+sindri geo get node
+sindri geo get node --test
 sindri nginx install --test
+sindri nginx conf
 sindri nginx status
 sindri cert new example.com
 ```
@@ -76,7 +87,8 @@ sindri cert new example.com
 When a required CLI argument is omitted, Sindri asks for it in the terminal.
 Mutating commands show progress on one fixed bottom line and dangerous commands
 ask for an explicit confirmation. JSON responses are emitted only by
-`sindri machine`.
+`sindri machine`. Human CLI responses are framed with separators and use
+TTY-only true-color status highlighting; `NO_COLOR` disables ANSI colors.
 
 ## Machine mode
 

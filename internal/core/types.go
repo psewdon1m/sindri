@@ -142,6 +142,7 @@ type Scenario struct {
 	ID               string      `json:"id"`
 	APIVersion       int         `json:"api_version"`
 	CLIPath          []string    `json:"cli_path"`
+	CLIAliases       [][]string  `json:"cli_aliases,omitempty"`
 	Usage            string      `json:"usage"`
 	Title            string      `json:"title"`
 	Description      string      `json:"description"`
@@ -149,6 +150,7 @@ type Scenario struct {
 	Inputs           []InputSpec `json:"inputs"`
 	Risk             Risk        `json:"risk"`
 	ReadOnly         bool        `json:"read_only"`
+	Interactive      bool        `json:"interactive,omitempty"`
 	Steps            []StepSpec  `json:"steps"`
 	Handler          Handler     `json:"-"`
 }

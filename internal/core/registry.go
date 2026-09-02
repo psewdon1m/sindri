@@ -39,12 +39,14 @@ func (r *Registry) MatchCLI(args []string) (CLIMatch, []string, bool) {
 	best := CLIMatch{}
 	found := false
 	for _, item := range r.items {
-		if len(item.CLIPath) == 0 || len(item.CLIPath) > len(args) {
-			continue
-		}
-		if equalWords(item.CLIPath, args[:len(item.CLIPath)]) && len(item.CLIPath) > best.Length {
-			best = CLIMatch{Scenario: item, Length: len(item.CLIPath)}
-			found = true
+		for _, path := range scenarioCLIPaths(item) {
+			if len(path) == 0 || len(path) > len(args) {
+				continue
+			}
+			if equalWords(path, args[:len(path)]) && len(path) > best.Length {
+				best = CLIMatch{Scenario: item, Length: len(path)}
+				found = true
+			}
 		}
 	}
 	if !found {
@@ -56,14 +58,27 @@ func (r *Registry) MatchCLI(args []string) (CLIMatch, []string, bool) {
 func (r *Registry) FindCLIGroup(path []string) []Scenario {
 	var out []Scenario
 	for _, item := range r.items {
-		if len(item.CLIPath) < len(path) {
-			continue
-		}
-		if equalWords(path, item.CLIPath[:len(path)]) {
+		if scenarioMatchesCLIGroup(item, path) {
 			out = append(out, item)
 		}
 	}
 	return out
+}
+
+func scenarioCLIPaths(s Scenario) [][]string {
+	paths := make([][]string, 0, 1+len(s.CLIAliases))
+	paths = append(paths, s.CLIPath)
+	paths = append(paths, s.CLIAliases...)
+	return paths
+}
+
+func scenarioMatchesCLIGroup(s Scenario, group []string) bool {
+	for _, path := range scenarioCLIPaths(s) {
+		if len(path) >= len(group) && equalWords(group, path[:len(group)]) {
+			return true
+		}
+	}
+	return false
 }
 
 func equalWords(a []string, b []string) bool {

@@ -54,6 +54,7 @@ const (
 	aptCommandTimeout     = 15 * time.Minute
 	serviceCommandTimeout = 45 * time.Second
 	certbotCommandTimeout = 15 * time.Minute
+	fail2banJailPath      = "/etc/fail2ban/jail.d/90-sindri-sshd.local"
 )
 
 var aptEnvironment = map[string]string{
@@ -76,6 +77,10 @@ func runSystemctl(ctx core.Context, args ...string) adapters.CommandResult {
 
 func runCertbot(ctx core.Context, args ...string) adapters.CommandResult {
 	return adapters.RunWithEnvTimeout(ctx, resolverRetryEnvironment, certbotCommandTimeout, "certbot", args...)
+}
+
+func runFail2ban(ctx core.Context, args ...string) adapters.CommandResult {
+	return adapters.RunWithTimeout(ctx, serviceCommandTimeout, "fail2ban-client", args...)
 }
 
 func regexpUsername() func(string) bool {
@@ -106,7 +111,8 @@ func makeReady(ctx core.Context, _ core.Request, _ map[string]interface{}) core.
 	}{
 		{"apt_update", []string{"update"}},
 		{"apt_upgrade", []string{"-y", "upgrade"}},
-		{"install_tools", []string{"install", "-y", "git", "curl", "gnupg"}},
+		{"install_tools", []string{"install", "-y", "git", "curl", "gnupg", "nano"}},
+		{"install_fail2ban", []string{"install", "-y", "fail2ban"}},
 		{"autoremove", []string{"autoremove", "-y"}},
 		{"autoclean", []string{"autoclean"}},
 	}
@@ -123,21 +129,70 @@ func makeReady(ctx core.Context, _ core.Request, _ map[string]interface{}) core.
 	if run := runSystemctl(ctx, "restart", "systemd-journald"); run.ExitCode != 0 {
 		return commandFailed("JOURNAL_RESTART_FAILED", "journal_limits", run)
 	}
+	fail2banPath := hostPath(ctx.Env, fail2banJailPath)
+	ports := sshPorts(ctx.Env)
+	if err := atomicWrite(fail2banPath, fail2banSSHDJail(ports), 0644); err != nil {
+		return failed("FAIL2BAN_CONFIGURATION_FAILED", err.Error(), core.ExitGeneralFailure)
+	}
+	if run := runFail2ban(ctx, "-t"); run.ExitCode != 0 {
+		return commandFailed("FAIL2BAN_CONFIGURATION_INVALID", "validate_fail2ban", run)
+	}
+	if run := runSystemctl(ctx, "enable", "fail2ban"); run.ExitCode != 0 {
+		return commandFailed("FAIL2BAN_SERVICE_FAILED", "enable_fail2ban", run)
+	}
+	if run := runSystemctl(ctx, "restart", "fail2ban"); run.ExitCode != 0 {
+		return commandFailed("FAIL2BAN_SERVICE_FAILED", "restart_fail2ban", run)
+	}
+	if run := runSystemctl(ctx, "is-active", "--quiet", "fail2ban"); run.ExitCode != 0 {
+		return commandFailed("FAIL2BAN_VERIFICATION_FAILED", "verify_fail2ban_service", run)
+	}
+	fail2banStatus := runFail2ban(ctx, "status", "sshd")
+	if fail2banStatus.ExitCode != 0 {
+		return commandFailed("FAIL2BAN_VERIFICATION_FAILED", "verify_sshd_jail", fail2banStatus)
+	}
 	tools := map[string]string{}
-	for label, command := range map[string]string{"git": "git", "curl": "curl", "gpg": "gpg"} {
+	for label, command := range map[string]string{"git": "git", "curl": "curl", "gpg": "gpg", "nano": "nano"} {
 		run := adapters.Run(ctx, command, "--version")
 		if run.ExitCode != 0 {
 			return commandFailed("TOOL_VERIFICATION_FAILED", label, run)
 		}
 		tools[label] = firstLine(run.Stdout)
 	}
+	if run := runFail2ban(ctx, "--version"); run.ExitCode != 0 {
+		return commandFailed("TOOL_VERIFICATION_FAILED", "fail2ban", run)
+	} else {
+		tools["fail2ban"] = firstLine(run.Stdout)
+	}
 	resources := loadManaged(ctx.Env)
-	resources.Packages = mergeUnique(resources.Packages, "git", "curl", "gnupg")
-	resources.Files = mergeUnique(resources.Files, journalPath)
+	resources.Packages = mergeUnique(resources.Packages, "git", "curl", "gnupg", "nano", "fail2ban")
+	resources.Services = mergeUnique(resources.Services, "fail2ban.service")
+	resources.Files = mergeUnique(resources.Files, journalPath, fail2banPath)
 	if err := saveManaged(ctx.Env, resources); err != nil {
 		return managedStateFailure(err)
 	}
-	return success("Base Ubuntu server packages are ready", true, map[string]interface{}{"tools": tools})
+	return success("Base Ubuntu server packages and SSH protection are ready", true, map[string]interface{}{
+		"tools": tools,
+		"fail2ban": map[string]interface{}{
+			"jail":   "sshd",
+			"ports":  ports,
+			"status": firstLine(fail2banStatus.Stdout),
+		},
+	})
+}
+
+func fail2banSSHDJail(ports []int) []byte {
+	values := make([]string, 0, len(ports))
+	for _, port := range ports {
+		values = append(values, strconv.Itoa(port))
+	}
+	return []byte(fmt.Sprintf(`[sshd]
+enabled = true
+backend = systemd
+port = %s
+findtime = 10m
+maxretry = 5
+bantime = 1h
+`, strings.Join(values, ",")))
 }
 
 func rebootHost(ctx core.Context, _ core.Request, _ map[string]interface{}) core.Result {
@@ -529,9 +584,9 @@ fi
 	if wasActive {
 		message = "Shared host Nginx updated and reloaded without interrupting the active service"
 	}
-	next := "Edit /etc/nginx/sites-available/default, issue certificates if needed, then run sindri nginx start"
+	next := "Run sindri nginx conf, issue certificates if needed, then run sindri nginx start"
 	if wasActive {
-		next = "Cloudflare proxy ranges are active; use sindri nginx reload after future site changes"
+		next = "Cloudflare proxy ranges are active; use sindri nginx conf and then sindri nginx reload for future site changes"
 	}
 	return success(message, true, map[string]interface{}{
 		"version":           versionText,
@@ -1336,7 +1391,7 @@ func osReleaseValue(path, key string) string {
 }
 
 func sshPorts(env core.Environment) []int {
-	ports := []int{22}
+	ports := []int{}
 	paths := []string{hostPath(env, "/etc/ssh/sshd_config")}
 	matches, _ := filepath.Glob(hostPath(env, "/etc/ssh/sshd_config.d/*.conf"))
 	paths = append(paths, matches...)
@@ -1353,6 +1408,9 @@ func sshPorts(env core.Environment) []int {
 				}
 			}
 		}
+	}
+	if len(ports) == 0 {
+		ports = append(ports, 22)
 	}
 	sort.Ints(ports)
 	out := []int{}

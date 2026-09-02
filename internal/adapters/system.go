@@ -40,6 +40,34 @@ func RunWithInputTimeout(ctx context.Context, input string, timeout time.Duratio
 	return run(ctx, input, nil, timeout, name, args...)
 }
 
+// RunInteractive attaches a command directly to Sindri's terminal. It is
+// intended for full-screen tools such as editors, where captured output and a
+// progress renderer would corrupt the terminal session.
+func RunInteractive(ctx context.Context, name string, args ...string) CommandResult {
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	err := cmd.Run()
+	code := 0
+	message := ""
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			code = exitErr.ExitCode()
+		} else {
+			code = -1
+		}
+		message = err.Error()
+	}
+	return CommandResult{
+		Command:  append([]string{name}, args...),
+		Stderr:   message,
+		ExitCode: code,
+		TimedOut: errors.Is(ctx.Err(), context.DeadlineExceeded),
+	}
+}
+
 func run(parent context.Context, input string, extraEnv map[string]string, timeout time.Duration, name string, args ...string) CommandResult {
 	ctx := parent
 	cancel := func() {}
