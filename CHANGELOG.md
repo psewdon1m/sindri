@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+## 1.3.0 - 2026-09-02
+
+- Add reusable CLI aliases, including `mir` for `make_it_ready` and `fw` for
+  the complete firewall command group.
+- Make base server preparation consistently update and upgrade APT packages,
+  install and configure the Fail2ban SSH jail, and install Nano.
+- Add framed human output with TTY-aware true-color success, failure and
+  neutral states while preserving strict unformatted machine JSON.
+- Add verified Xray geodata updates for an operator-selected Docker container,
+  including checksum validation, retained backups, restart verification,
+  no-op detection and automatic rollback.
+- Add `sindri nginx conf` with automatic single-file editing and interactive
+  numbered selection from `/etc/nginx/sites-available` when multiple site
+  configurations exist.
+
 ## 1.2.0 - 2026-08-15
 
 - Replace pathname-only operation locking with a kernel advisory lock that
