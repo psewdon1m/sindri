@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.3.2 - 2026-09-04
+
 - Add `sindri cert status` to list Let's Encrypt certificates with their X.509
   issuance time and full paths to `fullchain.pem` and `privkey.pem`.
 - Add verified host Xray installation, root-only multi-link VLESS/REALITY
