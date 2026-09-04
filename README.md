@@ -61,7 +61,7 @@ its SHA-256 and runs `sindri init`. Go is not installed on the target VPS.
 ```bash
 make test
 make build
-make deb VERSION=1.3.0
+make deb VERSION=1.3.1
 ```
 
 The local development machine must have Go installed. The target runtime does not need Go when installed from the built package.

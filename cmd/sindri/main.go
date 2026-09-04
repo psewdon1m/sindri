@@ -20,7 +20,7 @@ import (
 )
 
 var (
-	version         = "1.3.0"
+	version         = "1.3.1"
 	protocolVersion = "1"
 	buildID         = "source"
 )

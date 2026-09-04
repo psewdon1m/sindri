@@ -137,6 +137,7 @@ func TestProductionHandlersAgainstIsolatedSystemAdapters(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeFile(t, hostPath(env, "/etc/ssh/sshd_config"), "Port 2222\n")
+	t.Setenv("FAKE_FAIL2BAN_STATUS_FAILURES", "2")
 	ctx := core.Context{Context: context.Background(), Env: env}
 
 	assertResult(t, "make ready", makeReady(ctx, core.Request{}, nil), core.StatusSuccess)
@@ -167,6 +168,9 @@ func TestProductionHandlersAgainstIsolatedSystemAdapters(t *testing.T) {
 		if !strings.Contains(string(fail2banCalls), expected) {
 			t.Fatalf("Fail2ban client was not called with %q: %s", expected, fail2banCalls)
 		}
+	}
+	if attempts := strings.Count(string(fail2banCalls), "status sshd"); attempts != 3 {
+		t.Fatalf("Fail2ban readiness attempts = %d, want 3: %s", attempts, fail2banCalls)
 	}
 	managed := loadManaged(env)
 	if !containsString(managed.Packages, "fail2ban") ||
@@ -597,7 +601,17 @@ case "$name" in
     printf '%s\n' "$*" >>"$state/fail2ban-client-calls"
     case "$*" in
       "--version") printf 'Fail2Ban vtest\n' ;;
-      "status sshd") printf 'Status for the jail: sshd\n' ;;
+	  "status sshd")
+		failures=${FAKE_FAIL2BAN_STATUS_FAILURES:-0}
+		attempt=$(cat "$state/fail2ban-status-attempt" 2>/dev/null || printf '0')
+		attempt=$((attempt + 1))
+		printf '%s' "$attempt" >"$state/fail2ban-status-attempt"
+		if [ "$attempt" -le "$failures" ]; then
+		  printf 'ERROR Failed to access socket path: /var/run/fail2ban/fail2ban.sock. Is fail2ban running?\n' >&2
+		  exit 1
+		fi
+		printf 'Status for the jail: sshd\n'
+		;;
       "-t") printf 'OK: configuration test is successful\n' ;;
     esac
     ;;

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 1.3.1 - 2026-09-04
+
+- Retry Fail2ban service and SSH jail readiness after startup so slow socket
+  creation does not make `make_it_ready` or `mir` fail spuriously.
+
 ## 1.3.0 - 2026-09-02
 
 - Add reusable CLI aliases, including `mir` for `make_it_ready` and `fw` for

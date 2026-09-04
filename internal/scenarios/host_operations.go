@@ -55,6 +55,8 @@ const (
 	serviceCommandTimeout = 45 * time.Second
 	certbotCommandTimeout = 15 * time.Minute
 	fail2banJailPath      = "/etc/fail2ban/jail.d/90-sindri-sshd.local"
+	fail2banReadyAttempts = 20
+	fail2banReadyInterval = 500 * time.Millisecond
 )
 
 var aptEnvironment = map[string]string{
@@ -143,11 +145,11 @@ func makeReady(ctx core.Context, _ core.Request, _ map[string]interface{}) core.
 	if run := runSystemctl(ctx, "restart", "fail2ban"); run.ExitCode != 0 {
 		return commandFailed("FAIL2BAN_SERVICE_FAILED", "restart_fail2ban", run)
 	}
-	if run := runSystemctl(ctx, "is-active", "--quiet", "fail2ban"); run.ExitCode != 0 {
-		return commandFailed("FAIL2BAN_VERIFICATION_FAILED", "verify_fail2ban_service", run)
-	}
-	fail2banStatus := runFail2ban(ctx, "status", "sshd")
-	if fail2banStatus.ExitCode != 0 {
+	fail2banService, fail2banStatus, ready := waitForFail2banSSHDJail(ctx, fail2banReadyAttempts, fail2banReadyInterval)
+	if !ready {
+		if fail2banService.ExitCode != 0 {
+			return commandFailed("FAIL2BAN_VERIFICATION_FAILED", "verify_fail2ban_service", fail2banService)
+		}
 		return commandFailed("FAIL2BAN_VERIFICATION_FAILED", "verify_sshd_jail", fail2banStatus)
 	}
 	tools := map[string]string{}
@@ -178,6 +180,37 @@ func makeReady(ctx core.Context, _ core.Request, _ map[string]interface{}) core.
 			"status": firstLine(fail2banStatus.Stdout),
 		},
 	})
+}
+
+func waitForFail2banSSHDJail(ctx core.Context, attempts int, interval time.Duration) (adapters.CommandResult, adapters.CommandResult, bool) {
+	if attempts < 1 {
+		attempts = 1
+	}
+	var service adapters.CommandResult
+	var jail adapters.CommandResult
+	for attempt := 1; attempt <= attempts; attempt++ {
+		service = runSystemctl(ctx, "is-active", "--quiet", "fail2ban")
+		if service.ExitCode == 0 {
+			jail = runFail2ban(ctx, "status", "sshd")
+			if jail.ExitCode == 0 {
+				return service, jail, true
+			}
+		}
+		if ctx.Log != nil {
+			ctx.Log.Write("fail2ban_readiness attempt=%d/%d service_exit=%d jail_exit=%d", attempt, attempts, service.ExitCode, jail.ExitCode)
+		}
+		if service.TimedOut || jail.TimedOut || attempt == attempts {
+			break
+		}
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return service, jail, false
+		case <-timer.C:
+		}
+	}
+	return service, jail, false
 }
 
 func fail2banSSHDJail(ports []int) []byte {
