@@ -2,6 +2,7 @@ package scenarios
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"sindri/internal/core"
@@ -58,6 +59,35 @@ func TestGeoGetRequestsContainerAndAcceptsItPositionally(t *testing.T) {
 	}
 	if missing.Fields[0].Name != "container" || missing.Fields[0].Prompt != "Enter the Docker container name:" {
 		t.Fatalf("unexpected container prompt: %#v", missing.Fields[0])
+	}
+}
+
+func TestCertStatusMatchesCLIAndIsReadOnly(t *testing.T) {
+	registry := NewRegistry("test", "1", "test")
+	match, positional, ok := registry.MatchCLI([]string{"cert", "status"})
+	if !ok || match.Scenario.ID != "cert.status" {
+		t.Fatalf("cert status did not match: %#v, %v", match, ok)
+	}
+	if !match.Scenario.ReadOnly || match.Scenario.Risk != core.RiskRead {
+		t.Fatalf("cert status is not read-only: %#v", match.Scenario)
+	}
+	if len(positional) != 0 {
+		t.Fatalf("cert status positional arguments = %#v", positional)
+	}
+}
+
+func TestProxyCommandsMatchExpectedCLIPaths(t *testing.T) {
+	registry := NewRegistry("test", "1", "test")
+	cases := map[string]string{
+		"ip status": "ip.status", "xray install": "xray.install", "xray status": "xray.status",
+		"xray config": "xray.config", "xray on": "xray.on", "xray off": "xray.off",
+		"xray uninstall": "xray.uninstall", "nginx uninstall": "nginx.uninstall",
+	}
+	for cli, action := range cases {
+		match, _, ok := registry.MatchCLI(strings.Fields(cli))
+		if !ok || match.Scenario.ID != action {
+			t.Fatalf("%s matched %#v, want %s", cli, match, action)
+		}
 	}
 }
 

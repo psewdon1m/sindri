@@ -20,14 +20,30 @@ func NewRegistry(version string, protocolVersion string, buildID string) *core.R
 	r := core.NewRegistry()
 	addMeta(r, version, protocolVersion, buildID)
 	addSystem(r)
+	addIP(r)
 	addFirewall(r)
 	addDocker(r)
 	addGeo(r)
+	addXray(r)
 	addNginx(r)
 	addUsers(r)
 	addCerts(r)
 	addReleaseManagement(r)
 	return r
+}
+
+func addIP(r *core.Registry) {
+	r.Add(core.Scenario{
+		ID:          "ip.status",
+		APIVersion:  1,
+		CLIPath:     []string{"ip", "status"},
+		Usage:       "sindri ip status",
+		Title:       "Show public IP through the local Xray proxy",
+		Description: "Queries ipinfo.io strictly through http://127.0.0.1:18080 and reports the proxy egress location.",
+		Risk:        core.RiskRead,
+		ReadOnly:    true,
+		Handler:     ipStatus,
+	})
 }
 
 func addNginx(r *core.Registry) {
@@ -64,6 +80,12 @@ func addNginx(r *core.Registry) {
 		{ID: "service", Name: "Stop Nginx"},
 		{ID: "verify", Name: "Verify the stopped service"},
 	}, nginxStop))
+	r.Add(hostScenario("nginx.uninstall", []string{"nginx", "uninstall"}, "sindri nginx uninstall", "Uninstall Nginx and remove its service files", core.RiskDangerous, []core.StepSpec{
+		{ID: "stop", Name: "Stop and disable Nginx"},
+		{ID: "packages", Name: "Purge Nginx packages"},
+		{ID: "files", Name: "Remove Nginx configuration, cache and logs"},
+		{ID: "verify", Name: "Verify Nginx removal"},
+	}, nginxUninstall))
 }
 
 func addReleaseManagement(r *core.Registry) {
@@ -372,6 +394,43 @@ func addGeo(r *core.Registry) {
 	r.Add(scenario)
 }
 
+func addXray(r *core.Registry) {
+	r.Add(hostScenario("xray.install", []string{"xray", "install"}, "sindri xray install", "Install Xray for transparent proxying", core.RiskChange, []core.StepSpec{
+		{ID: "precheck", Name: "Verify the supported system"},
+		{ID: "dependencies", Name: "Install nftables and routing dependencies"},
+		{ID: "download", Name: "Download and verify the official Xray release"},
+		{ID: "service", Name: "Install the hardened Xray and routing services"},
+		{ID: "verify", Name: "Verify the Xray installation"},
+	}, xrayInstall))
+	r.Add(core.Scenario{
+		ID: "xray.status", APIVersion: 1, CLIPath: []string{"xray", "status"},
+		Usage: "sindri xray status", Title: "Show Xray proxy and fail-closed routing status",
+		Risk: core.RiskRead, ReadOnly: true, Handler: xrayStatus,
+	})
+	configScenario := hostScenario("xray.config", []string{"xray", "config"}, "sindri xray config", "Edit and validate VLESS profiles", core.RiskChange, xrayConfigEditSteps, xrayConfigEdit)
+	configScenario.Description = "Opens /etc/sindri/xray/profiles.vless in nano; enter one VLESS URL per line. Invalid edits are rolled back."
+	configScenario.Interactive = true
+	r.Add(configScenario)
+	r.Add(hostScenario("xray.on", []string{"xray", "on"}, "sindri xray on [profile]", "Enable fail-closed transparent proxying for the host and Docker", core.RiskChange, []core.StepSpec{
+		{ID: "profiles", Name: "Load and select a VLESS profile"},
+		{ID: "config", Name: "Generate and validate the Xray configuration"},
+		{ID: "routing", Name: "Enable persistent fail-closed TPROXY routing"},
+		{ID: "service", Name: "Start Xray"},
+		{ID: "verify", Name: "Verify the proxy egress IP"},
+	}, xrayOn, core.InputSpec{Name: "profile", Position: 1, Type: core.InputString}))
+	r.Add(hostScenario("xray.off", []string{"xray", "off"}, "sindri xray off", "Disable transparent proxying and restore direct connectivity", core.RiskDangerous, []core.StepSpec{
+		{ID: "service", Name: "Stop and disable Xray"},
+		{ID: "routing", Name: "Remove Sindri TPROXY routing"},
+		{ID: "verify", Name: "Verify direct connectivity is restored"},
+	}, xrayOff))
+	r.Add(hostScenario("xray.uninstall", []string{"xray", "uninstall"}, "sindri xray uninstall", "Uninstall Xray and remove all Sindri Xray files", core.RiskDangerous, []core.StepSpec{
+		{ID: "off", Name: "Disable Xray and transparent routing"},
+		{ID: "services", Name: "Remove Xray systemd services"},
+		{ID: "files", Name: "Remove Xray binaries, profiles and state"},
+		{ID: "verify", Name: "Verify Xray removal"},
+	}, xrayUninstall))
+}
+
 func addUsers(r *core.Registry) {
 	username := core.InputSpec{Name: "username", Position: 1, Type: core.InputString, Required: true, Prompt: "Which username should be used?"}
 	password := core.InputSpec{Name: "password", Position: 2, Type: core.InputSecret, Required: true, Secret: true, Prompt: "Enter the password securely"}
@@ -381,6 +440,17 @@ func addUsers(r *core.Registry) {
 }
 
 func addCerts(r *core.Registry) {
+	r.Add(core.Scenario{
+		ID:          "cert.status",
+		APIVersion:  1,
+		CLIPath:     []string{"cert", "status"},
+		Usage:       "sindri cert status",
+		Title:       "List installed Let's Encrypt certificates",
+		Description: "Lists certificates from /etc/letsencrypt/live with their issuance time and fullchain/private-key paths.",
+		Risk:        core.RiskRead,
+		ReadOnly:    true,
+		Handler:     certificateStatus,
+	})
 	r.Add(core.Scenario{
 		ID: "cert.new", APIVersion: 1, CLIPath: []string{"cert", "new"},
 		Usage: "sindri cert new [domain]", Title: "Issue a certificate with Certbot standalone",

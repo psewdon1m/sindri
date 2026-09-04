@@ -48,6 +48,69 @@ func TestCLIInputRequiredIsNotJSON(t *testing.T) {
 	}
 }
 
+func TestCertificateStatusUsesNumberedHumanOutput(t *testing.T) {
+	result := core.Result{
+		Status:  core.StatusSuccess,
+		Action:  "cert.status",
+		Message: "Certificates found: 2",
+		Data: map[string]interface{}{
+			"count": 2,
+			"certificates": []map[string]interface{}{
+				{
+					"name":           "alpha.example.test",
+					"issued_at":      "2026-08-12T09:08:07Z",
+					"fullchain_path": "/etc/letsencrypt/live/alpha.example.test/fullchain.pem",
+					"privkey_path":   "/etc/letsencrypt/live/alpha.example.test/privkey.pem",
+				},
+				{
+					"name":           "zeta.example.test",
+					"issued_at":      "2026-09-04T12:34:56Z",
+					"fullchain_path": "/etc/letsencrypt/live/zeta.example.test/fullchain.pem",
+					"privkey_path":   "/etc/letsencrypt/live/zeta.example.test/privkey.pem",
+				},
+			},
+		},
+	}
+
+	var output bytes.Buffer
+	printResult(&output, result)
+	text := output.String()
+	for _, expected := range []string{
+		"Certificates found: 2",
+		"1. alpha.example.test",
+		"Issued at: 2026-08-12 09:08:07 UTC",
+		"Fullchain: /etc/letsencrypt/live/alpha.example.test/fullchain.pem",
+		"Private key: /etc/letsencrypt/live/alpha.example.test/privkey.pem",
+		"2. zeta.example.test",
+	} {
+		if !strings.Contains(text, expected) {
+			t.Fatalf("certificate status output is missing %q: %q", expected, text)
+		}
+	}
+}
+
+func TestIPStatusUsesStableHumanFieldOrder(t *testing.T) {
+	result := core.Result{
+		Status: core.StatusSuccess, Action: "ip.status", Message: "Proxy egress IP collected",
+		Data: map[string]interface{}{
+			"ip": "203.0.113.9", "country": "NL", "region": "North Holland",
+			"city": "Amsterdam", "org": "AS64500 Example", "proxy": "http://127.0.0.1:18080",
+		},
+	}
+	var output bytes.Buffer
+	printResult(&output, result)
+	text := output.String()
+	want := []string{"IP: 203.0.113.9", "Country: NL", "Region: North Holland", "City: Amsterdam", "Organization: AS64500 Example"}
+	position := -1
+	for _, expected := range want {
+		next := strings.Index(text, expected)
+		if next <= position {
+			t.Fatalf("IP status field %q is missing or out of order: %q", expected, text)
+		}
+		position = next
+	}
+}
+
 func TestDynamicChoicePromptListsOptionsAndAcceptsNumber(t *testing.T) {
 	fields := []core.FieldRequirement{{
 		Name: "config", Type: core.InputChoice, Required: true,

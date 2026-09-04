@@ -15,8 +15,8 @@ Implemented in this repository:
   JSON machine interface.
 - Input validation, one-time approvals, test mode, stale-lock recovery, bounded
   redacted run logs and concurrency-safe history.
-- Read commands: `version`, `help`, `info`, `doctor`, `history`,
-  `firewall status`, `docker info` and bounded `docker logs`.
+- Read commands: `version`, `help`, `info`, `doctor`, `history`, `ip status`,
+  `xray status`, `firewall status`, `docker info` and bounded `docker logs`.
 - Production system operations: base Ubuntu preparation with a managed
   Fail2ban SSH jail, reboot, reversible network lockdown/recovery and
   managed-scope exterminatus.
@@ -24,11 +24,13 @@ Implemented in this repository:
 - Production Docker operations: install, uninstall, up, down, clean and logs.
 - Verified Xray geodata updates for the `node` container, with backup, restart
   and automatic rollback.
+- Managed Xray installation, multi-profile VLESS/REALITY configuration and
+  persistent fail-closed transparent proxying for host and Docker TCP/UDP/DNS.
 - Shared host Nginx operations: install, status, validated start, zero-downtime
-  configuration reload and stop, including trusted Cloudflare proxy ranges and
-  restoration of the original visitor IP.
+  configuration reload, stop and full uninstall, including trusted Cloudflare
+  proxy ranges and restoration of the original visitor IP.
 - Production local-user operations: add, delete and password change.
-- Production certificate operations: issue, copy and delete.
+- Production certificate operations: status, issue, copy and delete.
 - DNS and Let's Encrypt connectivity preflight with resolver retries before
   certificate issuance.
 - Self-update from a checksummed HTTPS release manifest.
@@ -40,9 +42,9 @@ Release creation and publication are documented in
 [RELEASING.md](RELEASING.md).
 
 Agent Node installation and lifecycle commands are deliberately not part of
-Sindri's registry, and Sindri never reads Kernel. The narrowly scoped
-`geo get` maintenance command only updates Xray geodata in an existing,
-operator-selected container.
+Sindri's registry, and Sindri never reads Kernel. The `geo get` maintenance
+command updates Xray geodata in an operator-selected container; the separate
+host Xray commands manage only Sindri's transparent outbound proxy.
 
 ## Production installation
 
@@ -78,6 +80,11 @@ sindri firewall open 80 tcp --test
 sindri geo get
 sindri geo get node
 sindri geo get node --test
+sindri xray install --test
+sindri xray config
+sindri xray on
+sindri ip status
+sindri xray status
 sindri nginx install --test
 sindri nginx conf
 sindri nginx status

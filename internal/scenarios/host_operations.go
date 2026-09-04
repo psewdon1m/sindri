@@ -726,6 +726,109 @@ func nginxStop(ctx core.Context, _ core.Request, _ map[string]interface{}) core.
 	return success("Shared host Nginx stopped", true, nil)
 }
 
+func nginxUninstall(ctx core.Context, _ core.Request, _ map[string]interface{}) core.Result {
+	if failure := requireUbuntuRoot(ctx, "NGINX_UNINSTALL_PRECHECK_FAILED"); failure != nil {
+		return *failure
+	}
+	packages := installedNginxPackages(ctx)
+	commandInstalled := adapters.CommandExists("nginx")
+	if commandInstalled && len(packages) == 0 {
+		return failed("NGINX_UNMANAGED_INSTALLATION", "nginx is not owned by an installed Ubuntu package; refusing to remove unknown files", core.ExitManagedScopeViolation)
+	}
+	installed := commandInstalled || len(packages) > 0
+	paths := []string{
+		"/etc/nginx",
+		"/var/log/nginx",
+		"/var/cache/nginx",
+		"/var/lib/nginx",
+	}
+	filesPresent := false
+	for _, item := range paths {
+		if fileExists(hostPath(ctx.Env, item)) {
+			filesPresent = true
+			break
+		}
+	}
+	for _, item := range []string{nginxCertbotPre, nginxCertbotPost, "/run/sindri-nginx-certbot-was-running"} {
+		if fileExists(hostPath(ctx.Env, item)) {
+			filesPresent = true
+		}
+	}
+	if !installed && !filesPresent {
+		return success("Nginx is not installed", false, map[string]interface{}{"installed": false})
+	}
+	if installed {
+		if run := runSystemctl(ctx, "stop", "nginx"); run.ExitCode != 0 {
+			return commandFailed("NGINX_UNINSTALL_FAILED", "stop", run)
+		}
+		if run := runSystemctl(ctx, "disable", "nginx"); run.ExitCode != 0 {
+			return commandFailed("NGINX_UNINSTALL_FAILED", "disable", run)
+		}
+	}
+	if len(packages) > 0 {
+		if run := runApt(ctx, append([]string{"purge", "-y"}, packages...)...); run.ExitCode != 0 {
+			return commandFailed("NGINX_UNINSTALL_FAILED", "packages", run)
+		}
+	}
+	for _, item := range paths {
+		if _, err := safeRemoveManaged(hostPath(ctx.Env, item)); err != nil {
+			return failed("NGINX_UNINSTALL_FAILED", item+": "+err.Error(), core.ExitGeneralFailure)
+		}
+	}
+	for _, item := range []string{nginxCertbotPre, nginxCertbotPost, "/run/sindri-nginx-certbot-was-running"} {
+		if err := os.Remove(hostPath(ctx.Env, item)); err != nil && !os.IsNotExist(err) {
+			return failed("NGINX_UNINSTALL_FAILED", item+": "+err.Error(), core.ExitGeneralFailure)
+		}
+	}
+	if adapters.CommandExists("nginx") {
+		return failed("NGINX_UNINSTALL_VERIFY_FAILED", "nginx remains available in PATH", core.ExitVerificationFailed)
+	}
+	resources := loadManaged(ctx.Env)
+	for _, item := range packages {
+		resources.Packages = removeString(resources.Packages, item)
+	}
+	resources.Services = removeString(resources.Services, "nginx.service")
+	filteredFiles := resources.Files[:0]
+	for _, managed := range resources.Files {
+		remove := managed == hostPath(ctx.Env, nginxCertbotPre) || managed == hostPath(ctx.Env, nginxCertbotPost)
+		for _, directory := range paths {
+			root := filepath.Clean(hostPath(ctx.Env, directory))
+			candidate := filepath.Clean(managed)
+			if candidate == root || strings.HasPrefix(candidate, root+string(filepath.Separator)) {
+				remove = true
+			}
+		}
+		if !remove {
+			filteredFiles = append(filteredFiles, managed)
+		}
+	}
+	resources.Files = filteredFiles
+	if err := saveManaged(ctx.Env, resources); err != nil {
+		return managedStateFailure(err)
+	}
+	return success("Nginx packages, configuration, cache and logs removed; certificates were preserved", true, map[string]interface{}{
+		"certificates_preserved": true,
+	})
+}
+
+func installedNginxPackages(ctx core.Context) []string {
+	if !adapters.CommandExists("dpkg-query") {
+		if adapters.CommandExists("nginx") {
+			return []string{"nginx"}
+		}
+		return nil
+	}
+	packages := []string{}
+	run := adapters.Run(ctx, "dpkg-query", "-W", "-f=${binary:Package}\\t${db:Status-Abbrev}\\n", "nginx*", "libnginx-mod-*")
+	for _, line := range strings.Split(run.Stdout, "\n") {
+		fields := strings.SplitN(line, "\t", 2)
+		if len(fields) == 2 && strings.HasPrefix(fields[1], "ii") {
+			packages = mergeUnique(packages, strings.TrimSpace(fields[0]))
+		}
+	}
+	return packages
+}
+
 func requireNginxSite(ctx core.Context, code string) *core.Result {
 	available := hostPath(ctx.Env, nginxSiteAvailable)
 	enabled := hostPath(ctx.Env, nginxSiteEnabled)

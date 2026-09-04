@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Add `sindri cert status` to list Let's Encrypt certificates with their X.509
+  issuance time and full paths to `fullchain.pem` and `privkey.pem`.
+- Add verified host Xray installation, root-only multi-link VLESS/REALITY
+  profiles, interactive endpoint selection and persistent fail-closed TPROXY
+  routing for host and Docker TCP/UDP/DNS traffic over IPv4 and IPv6.
+- Add `sindri ip status` for proxy-only egress inspection plus Xray status,
+  off and uninstall lifecycle commands.
+- Add `sindri nginx uninstall` to purge Nginx configuration, cache and logs
+  while preserving Let's Encrypt certificates.
+
 ## 1.3.1 - 2026-09-04
 
 - Retry Fail2ban service and SSH jail readiness after startup so slow socket

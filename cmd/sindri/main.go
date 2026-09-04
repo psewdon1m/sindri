@@ -502,7 +502,13 @@ func printResultWithColor(w io.Writer, result core.Result, color bool) {
 		fmt.Fprintln(w, colorize(color, toneForStatus(result.Status), result.Message))
 	}
 	if len(result.Data) > 0 && result.Action != "meta.version" && result.Action != "meta.history" {
-		printHumanDataWithColor(w, result.Data, 0, color)
+		if result.Action == "ip.status" && result.Status == core.StatusSuccess {
+			printIPStatus(w, result.Data, color)
+		} else if result.Action == "cert.status" && result.Status == core.StatusSuccess {
+			printCertificateStatus(w, result.Data, color)
+		} else {
+			printHumanDataWithColor(w, result.Data, 0, color)
+		}
 	}
 	if len(result.Steps) > 0 {
 		for _, step := range result.Steps {
@@ -519,6 +525,62 @@ func printResultWithColor(w io.Writer, result core.Result, color bool) {
 	}
 	if result.DurationMS > 0 {
 		fmt.Fprintf(w, "Duration: %s\n", time.Duration(result.DurationMS)*time.Millisecond)
+	}
+}
+
+func printIPStatus(w io.Writer, data map[string]interface{}, color bool) {
+	for _, item := range []struct {
+		key   string
+		label string
+		good  bool
+	}{
+		{key: "ip", label: "IP", good: true},
+		{key: "country", label: "Country"},
+		{key: "region", label: "Region"},
+		{key: "city", label: "City"},
+		{key: "org", label: "Organization"},
+	} {
+		value := strings.TrimSpace(fmt.Sprint(data[item.key]))
+		if value == "" || value == "<nil>" {
+			value = "none"
+		}
+		tone := toneNeutral
+		if item.good {
+			tone = toneGood
+		}
+		fmt.Fprintf(w, "%s: %s\n", item.label, colorize(color, tone, value))
+	}
+}
+
+func printCertificateStatus(w io.Writer, data map[string]interface{}, color bool) {
+	type certificate struct {
+		Name          string `json:"name"`
+		IssuedAt      string `json:"issued_at"`
+		FullchainPath string `json:"fullchain_path"`
+		PrivkeyPath   string `json:"privkey_path"`
+	}
+	body, err := json.Marshal(data["certificates"])
+	if err != nil {
+		return
+	}
+	var certificates []certificate
+	if err := json.Unmarshal(body, &certificates); err != nil {
+		return
+	}
+	if len(certificates) == 0 {
+		fmt.Fprintln(w, "Certificates: none")
+		return
+	}
+	fmt.Fprintln(w, "Certificates:")
+	for index, item := range certificates {
+		issuedAt := item.IssuedAt
+		if parsed, err := time.Parse(time.RFC3339, item.IssuedAt); err == nil {
+			issuedAt = parsed.UTC().Format("2006-01-02 15:04:05 UTC")
+		}
+		fmt.Fprintf(w, "%d. %s\n", index+1, colorize(color, toneGood, item.Name))
+		fmt.Fprintf(w, "   Issued at: %s\n", issuedAt)
+		fmt.Fprintf(w, "   Fullchain: %s\n", item.FullchainPath)
+		fmt.Fprintf(w, "   Private key: %s\n", item.PrivkeyPath)
 	}
 }
 
